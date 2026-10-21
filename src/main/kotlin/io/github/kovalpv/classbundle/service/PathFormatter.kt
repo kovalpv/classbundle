@@ -1,7 +1,7 @@
 package io.github.kovalpv.classbundle.service
 
-import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.diagnostic.Logger
+import com.intellij.openapi.vfs.VirtualFile
 import io.github.kovalpv.classbundle.model.PathMode
 import java.nio.file.Path
 
@@ -42,8 +42,7 @@ internal object PathFormatter {
         return try {
             baseDir.relativize(path).toString()
         } catch (e: IllegalArgumentException) {
-            // Файл вне baseDir (другой том/корень) — фоллбек на абсолютный путь
-            logger.info("File ${path} is outside baseDir $baseDir, using absolute path")
+            logger.info("File $path is outside baseDir $baseDir, using absolute path")
             path.toAbsolutePath().toString()
         }
     }

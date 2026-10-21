@@ -23,7 +23,8 @@ internal object ExportPreferences {
 
     private val props = PropertiesComponent.getInstance()
 
-    private val defaultRelations: Set<RelationType> = setOf(RelationType.USAGE, RelationType.INHERITOR)
+    private val defaultRelations: Set<RelationType> =
+        setOf(RelationType.USAGE, RelationType.INHERITOR)
 
     var archiveMode: ArchiveMode
         get() = ArchiveMode.entries.firstOrNull { it.name == props.getValue(KEY_ARCHIVE_MODE) }

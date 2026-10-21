@@ -3,8 +3,6 @@ package io.github.kovalpv.classbundle.action
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.CommonDataKeys
-import com.intellij.openapi.project.Project
-import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.psi.PsiClass
 import com.intellij.psi.PsiFile
 import com.intellij.psi.PsiManager
@@ -22,7 +20,6 @@ class ExportClassBundleAction : AnAction("Export Class Bundle...") {
     }
 
     override fun update(e: AnActionEvent) {
-        // Показываем действие только если найден Java-класс
         e.presentation.isEnabledAndVisible = findTargetClass(e) != null
     }
 
@@ -32,23 +29,19 @@ class ExportClassBundleAction : AnAction("Export Class Bundle...") {
     private fun findTargetClass(e: AnActionEvent): PsiClass? {
         val project = e.project ?: return null
 
-        // 1. Пытаемся получить класс напрямую из PSI_ELEMENT (редактор)
-        val element = e.getData(CommonDataKeys.PSI_ELEMENT)
-        val fromElement = when (element) {
+        val fromElement = when (val element = e.getData(CommonDataKeys.PSI_ELEMENT)) {
             is PsiClass -> element
             is PsiFile -> PsiTreeUtil.findChildOfType(element, PsiClass::class.java)
             else -> null
         }
         if (fromElement != null) return fromElement
 
-        // 2. Пытаемся получить класс из PSI_FILE (редактор)
         val psiFile = e.getData(CommonDataKeys.PSI_FILE)
         if (psiFile != null) {
             val fromFile = PsiTreeUtil.findChildOfType(psiFile, PsiClass::class.java)
             if (fromFile != null) return fromFile
         }
 
-        // 3. Пытаемся получить класс из VIRTUAL_FILE (Project View)
         val virtualFile = e.getData(CommonDataKeys.VIRTUAL_FILE)
         if (virtualFile != null && virtualFile.extension == "java") {
             val psi = PsiManager.getInstance(project).findFile(virtualFile)

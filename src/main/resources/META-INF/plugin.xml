@@ -1,37 +1,36 @@
 <idea-plugin>
-    <id>io.github.kovalpv.classbundle</id>
-    <name>ClassBundle — Export Related Files</name>
-    <vendor>kovalpv</vendor>
+  <id>io.github.kovalpv.classbundle</id>
+  <name>ClassBundle — Export Related Files</name>
+  <vendor>kovalpv</vendor>
 
-    <idea-version since-build="242" />
+  <idea-version since-build="242"/>
 
-    <description><![CDATA[
+  <description><![CDATA[
         Collect files related to a Java class (usages, inheritors, nested classes)
         and export them to a ZIP archive — either the files themselves or a text
         list of paths. Useful for building minimal repro cases for bug reports.
     ]]></description>
 
-    <depends>com.intellij.modules.platform</depends>
-    <depends>com.intellij.modules.java</depends>
+  <depends>com.intellij.modules.platform</depends>
+  <depends>com.intellij.modules.java</depends>
 
-    <!-- Подключение файла ресурсов локализации -->
-    <resource-bundle>messages.ClassBundleBundle</resource-bundle>
+  <!-- Подключение файла ресурсов локализации -->
+  <resource-bundle>messages.ClassBundleBundle</resource-bundle>
 
-    <extensions defaultExtensionNs="com.intellij">
-        <!-- Идентификатор группы строго изменен под имя, используемое в ExportDialog.kt -->
-        <notificationGroup id="ClassBundle Export Errors" displayType="BALLOON"
-            icon="AllIcons.Ide.FatalError" />
-    </extensions>
+  <extensions defaultExtensionNs="com.intellij">
+    <!-- Идентификатор группы строго изменен под имя, используемое в ExportDialog.kt -->
+    <notificationGroup id="ClassBundle" displayType="BALLOON"/>
+  </extensions>
 
-    <actions>
-        <!-- Регистрация экшена контекстного меню -->
-        <action id="ClassBundle.ExportClassBundle"
-            class="io.github.kovalpv.classbundle.action.ExportClassBundleAction"
-            key="action.exportClassBundle">
-            <!-- Добавление пункта в контекстное меню дерева проекта -->
-            <add-to-group group-id="ProjectViewPopupMenu" anchor="last" />
-            <!-- Добавление пункта в контекстное меню редактора кода -->
-            <add-to-group group-id="EditorPopupMenu" anchor="last" />
-        </action>
-    </actions>
+  <actions>
+    <!-- Регистрация экшена контекстного меню -->
+    <action id="ClassBundle.ExportClassBundle"
+      class="io.github.kovalpv.classbundle.action.ExportClassBundleAction"
+      key="action.exportClassBundle">
+      <!-- Добавление пункта в контекстное меню дерева проекта -->
+      <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
+      <!-- Добавление пункта в контекстное меню редактора кода -->
+      <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+    </action>
+  </actions>
 </idea-plugin>

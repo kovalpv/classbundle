@@ -83,7 +83,6 @@ internal class ExportDialog(
     init {
         title = ClassBundleBundle.message("dialog.title")
 
-        // 1. Инициализация настроек из ExportPreferences (FR-12)
         val prefs = ExportPreferences
         usageCheckbox.isSelected = RelationType.USAGE in prefs.selectedRelations
         inheritorsCheckbox.isSelected = RelationType.INHERITOR in prefs.selectedRelations
@@ -95,7 +94,6 @@ internal class ExportDialog(
         filesRadio.isSelected = prefs.archiveMode == ArchiveMode.FILES
         pathsRadio.isSelected = prefs.archiveMode == ArchiveMode.PATH_LIST
 
-        // 2. Установка начального пути
         val dir = prefs.outputDir.ifBlank { project.basePath ?: "" }
         outputPathField.text = if (dir.isNotBlank()) {
             "$dir${File.separator}${prefs.filePattern}"
@@ -103,12 +101,10 @@ internal class ExportDialog(
             ""
         }
 
-        // 3. Кастомный обработчик для кнопки "Browse..." (Обзор)
         outputPathField.button.addActionListener {
             val currentText = outputPathField.text.trim()
             val currentFile = if (currentText.isNotEmpty()) File(currentText) else null
 
-            // Создаем диалог сохранения (Save File)
             val descriptor = FileSaverDescriptor(
                 ClassBundleBundle.message("export.fileChooser.title"),
                 "Select a path to save the exported Class Bundle",
@@ -116,7 +112,6 @@ internal class ExportDialog(
             )
             val dialog = FileChooserFactory.getInstance().createSaveFileDialog(descriptor, project)
 
-            // Берем текущую директорию и имя файла из текстового поля
             val initialDir = currentFile?.parentFile?.let {
                 LocalFileSystem.getInstance().findFileByIoFile(it)
             }
@@ -125,7 +120,6 @@ internal class ExportDialog(
             val wrapper = dialog.save(initialDir, initialName)
             if (wrapper != null) {
                 var path = wrapper.file.absolutePath
-                // Принудительно добавляем расширение .zip, если его нет
                 if (!path.endsWith(".zip", ignoreCase = true)) {
                     path += ".zip"
                 }
@@ -134,18 +128,15 @@ internal class ExportDialog(
             }
         }
 
-        // 4. Слушатель ручного ввода (чтобы кнопка OK реагировала на изменения)
         outputPathField.textField.document.addDocumentListener(object : DocumentListener {
             override fun insertUpdate(e: DocumentEvent) = updateOkState()
             override fun removeUpdate(e: DocumentEvent) = updateOkState()
             override fun changedUpdate(e: DocumentEvent) = updateOkState()
         })
 
-        // 5. Вызываем super.init() в самом конце
         super.init()
     }
 
-    // Вспомогательный метод
     private fun updateOkState() {
         isOKActionEnabled = canExport()
     }
@@ -163,7 +154,6 @@ internal class ExportDialog(
     override fun doOKAction() {
         if (!canExport()) return
 
-        // Сохраняем настройки перед запуском (FR-12)
         val prefs = ExportPreferences
         prefs.selectedRelations = selectedRelations()
         prefs.pathMode = if (relativeRadio.isSelected) PathMode.RELATIVE else PathMode.ABSOLUTE
@@ -180,7 +170,7 @@ internal class ExportDialog(
             return
         }
 
-        super.doOKAction() // сначала закрываем диалог
+        super.doOKAction()
 
         ProgressManager.getInstance().run(
             object : Task.Backgroundable(project, "Exporting classes", true) {
@@ -227,7 +217,7 @@ internal class ExportDialog(
 
         if (listName.isBlank()) return
 
-        ReadAction.nonBlocking(Callable<List<VirtualFile>> {
+        ReadAction.nonBlocking(Callable {
             RelatedFilesCollector().collect(project, cls, relations)
         })
             .inSmartMode(project)
@@ -241,7 +231,6 @@ internal class ExportDialog(
                     val bookmarksManager =
                         BookmarksManager.getInstance(project) ?: return@finishOnUiThread
 
-                    // 1. Получаем или создаем группу
                     var group = bookmarksManager.getGroup(listName)
                     if (group == null) {
                         group = bookmarksManager.addGroup(listName, true)
@@ -249,7 +238,6 @@ internal class ExportDialog(
 
                     if (group == null) return@finishOnUiThread
 
-                    // 2. ОЧИСТКА ГРУППЫ: Удаляем старые закладки из этой группы (пересоздаем)
                     val allBookmarks = bookmarksManager.bookmarks
                     for (bookmark in allBookmarks) {
                         if (bookmarksManager.getGroups(bookmark).contains(group)) {
@@ -257,7 +245,6 @@ internal class ExportDialog(
                         }
                     }
 
-                    // 3. Сортируем файлы по полному имени класса
                     val sortedFiles = files.sortedBy { file ->
                         val psiFile = PsiManager.getInstance(project).findFile(file)
                         val psiClass =
@@ -265,10 +252,8 @@ internal class ExportDialog(
                         psiClass?.qualifiedName ?: file.name
                     }
 
-                    // 4. Вычисляем общий префикс пакетов
                     val commonPrefix = getCommonPackagePrefix(project, sortedFiles)
 
-                    // 5. Добавляем закладки с укороченными именами
                     for (file in sortedFiles) {
                         val bookmark = bookmarksManager.createBookmark(file)
                         if (bookmark != null) {
@@ -281,7 +266,6 @@ internal class ExportDialog(
                             }
                             val qualifiedName = psiClass?.qualifiedName ?: file.name
 
-                            // Обрезаем общий префикс (например, com.center2m.iem.getemon.)
                             val description =
                                 if (commonPrefix.isNotEmpty() && qualifiedName.startsWith(
                                         commonPrefix
@@ -315,7 +299,6 @@ internal class ExportDialog(
             .submit(AppExecutorUtil.getAppExecutorService())
     }
 
-    // Вспомогательный метод для поиска общего префикса пакетов
     private fun getCommonPackagePrefix(project: Project, files: List<VirtualFile>): String {
         val packages = files.mapNotNull { file ->
             val psiFile = PsiManager.getInstance(project).findFile(file)
@@ -323,7 +306,7 @@ internal class ExportDialog(
             psiClass?.qualifiedName?.substringBeforeLast('.')
         }.distinct()
 
-        if (packages.size <= 1) return "" // Если пакет один, не обрезаем его
+        if (packages.size <= 1) return ""
 
         val splitPackages = packages.map { it.split('.') }
         val first = splitPackages.first()
@@ -402,7 +385,6 @@ internal class ExportDialog(
         }
     }
 
-    // ИСПРАВЛЕНО: Прямой опрос чекбоксов вместо хака с valueOf
     private fun selectedRelations(): Set<RelationType> = buildSet {
         if (usageCheckbox.isSelected) add(RelationType.USAGE)
         if (inheritorsCheckbox.isSelected) add(RelationType.INHERITOR)
@@ -415,7 +397,6 @@ internal class ExportDialog(
         checkNotNull(cls) { "Target class '$className' not found in project" }
         val pathMode = if (relativeRadio.isSelected) PathMode.RELATIVE else PathMode.ABSOLUTE
 
-        // ИСПРАВЛЕНО: Прямое использование константы PATH_LIST
         val archiveMode = if (filesRadio.isSelected) ArchiveMode.FILES else ArchiveMode.PATH_LIST
 
         val outputZip = File(outputPathField.text.trim()).toPath()
@@ -438,7 +419,7 @@ internal class ExportDialog(
             return
         }
 
-        ReadAction.nonBlocking(Callable<List<String>> {
+        ReadAction.nonBlocking(Callable {
             val previewResult = ExportService.preview(project, cls, relations)
             previewResult.files.map { it.toString() }
         })
@@ -453,7 +434,6 @@ internal class ExportDialog(
 
     private fun notifyError(message: String) {
         try {
-            // ИСПРАВЛЕНО: ID группы нотификаций приведен в соответствие с plugin.xml
             NotificationGroupManager.getInstance()
                 .getNotificationGroup("ClassBundle")
                 .createNotification(

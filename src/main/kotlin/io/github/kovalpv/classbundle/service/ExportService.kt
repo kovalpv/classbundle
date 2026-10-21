@@ -29,7 +29,8 @@ internal object ExportService {
     fun export(request: ExportRequest, indicator: ProgressIndicator): ExportResult {
         indicator.fraction = 0.0
         indicator.text = ClassBundleBundle.message("export.progress.collecting")
-        val files = RelatedFilesCollector().collect(request.project, request.targetClass, request.relations)
+        val files =
+            RelatedFilesCollector().collect(request.project, request.targetClass, request.relations)
         if (files.isEmpty()) {
             throw IllegalStateException(ClassBundleBundle.message("export.error.noFiles"))
         }
@@ -42,7 +43,11 @@ internal object ExportService {
      * Computes the preview snapshot for the dialog: which files would be
      * exported plus their total size. Must be called from a background thread.
      */
-    fun preview(project: Project, targetClass: PsiClass, relations: Set<RelationType>): ExportPreview {
+    fun preview(
+        project: Project,
+        targetClass: PsiClass,
+        relations: Set<RelationType>
+    ): ExportPreview {
         val files = if (relations.isEmpty()) {
             emptyList()
         } else {

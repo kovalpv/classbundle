@@ -4,14 +4,14 @@ import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.psi.JavaRecursiveElementWalkingVisitor
 import com.intellij.psi.PsiClass
+import com.intellij.psi.PsiJavaCodeReferenceElement
 import com.intellij.psi.search.GlobalSearchScope
 import com.intellij.psi.search.searches.ClassInheritorsSearch
 import com.intellij.psi.search.searches.ReferencesSearch
 import io.github.kovalpv.classbundle.model.ExportRequest
 import io.github.kovalpv.classbundle.model.RelationType
-import com.intellij.psi.JavaRecursiveElementWalkingVisitor
-import com.intellij.psi.PsiJavaCodeReferenceElement
 
 /**
  * Сборка списка связанных файлов (FR-4, FR-5, FR-6, FR-7, SDD §9).
@@ -35,7 +35,11 @@ internal class RelatedFilesCollector {
      * Возвращает уникальный отсортированный по пути набор связанных файлов.
      * Вызов разрешён из фонового потока; read-action приобретается внутри.
      */
-    fun collect(project: Project, targetClass: PsiClass, relations: Set<RelationType>): List<VirtualFile> =
+    fun collect(
+        project: Project,
+        targetClass: PsiClass,
+        relations: Set<RelationType>
+    ): List<VirtualFile> =
         ReadAction.compute<List<VirtualFile>, Throwable> {
             doCollect(project, targetClass, relations)
         }
@@ -44,7 +48,11 @@ internal class RelatedFilesCollector {
     fun collect(request: ExportRequest): List<VirtualFile> =
         collect(request.project, request.targetClass, request.relations)
 
-    private fun doCollect(project: Project, targetClass: PsiClass, relations: Set<RelationType>): List<VirtualFile> {
+    private fun doCollect(
+        project: Project,
+        targetClass: PsiClass,
+        relations: Set<RelationType>
+    ): List<VirtualFile> {
         if (!targetClass.isValid) {
             logger.warn("Target class is invalid, nothing to collect: ${safeName(targetClass)}")
             return emptyList()
@@ -60,11 +68,9 @@ internal class RelatedFilesCollector {
                     RelationType.USAGE -> collectUsages(targetClass, scope, result)
                     RelationType.INHERITOR -> collectInheritors(targetClass, scope, result)
                     RelationType.NESTED -> collectNested(targetClass, result)
-                    // RelationType.DEPENDENCY -> collectDependencies(targetClass, result) 
                     RelationType.DEPENDENCY -> collectDependencies(project, targetClass, result)
                 }
             } catch (e: Exception) {
-                // PSI error (invalid element) → logger.warn, skip (SDD §9)
                 logger.warn("PSI search failed for relation $relation: ${e.message}", e)
             }
         }
@@ -73,19 +79,22 @@ internal class RelatedFilesCollector {
         return result.toList().sortedBy { it.path }
     }
 
-    private fun collectUsages(targetClass: PsiClass, scope: GlobalSearchScope, result: MutableSet<VirtualFile>) {
-        // ReferencesSearch.search(targetClass, scope).forEach { reference ->
-        //     addFile(reference.element.containingFile?.virtualFile, result)
-        // }
+    private fun collectUsages(
+        targetClass: PsiClass,
+        scope: GlobalSearchScope,
+        result: MutableSet<VirtualFile>
+    ) {
         ReferencesSearch.search(targetClass, scope).forEach { reference ->
             val psiElement = reference.element
-            if (psiElement != null) {
-                addFile(psiElement.containingFile?.virtualFile, result)
-            }
+            addFile(psiElement.containingFile?.virtualFile, result)
         }
     }
 
-    private fun collectInheritors(targetClass: PsiClass, scope: GlobalSearchScope, result: MutableSet<VirtualFile>) {
+    private fun collectInheritors(
+        targetClass: PsiClass,
+        scope: GlobalSearchScope,
+        result: MutableSet<VirtualFile>
+    ) {
         ClassInheritorsSearch.search(targetClass, scope, true).forEach { inheritor ->
             addFile(inheritor.containingFile?.virtualFile, result)
         }
@@ -109,24 +118,24 @@ internal class RelatedFilesCollector {
         } catch (e: Exception) {
             "unknown"
         }
-    
-        private fun collectDependencies(project: Project, targetClass: PsiClass, result: MutableSet<VirtualFile>) {
-        // Получаем скоуп проекта (в него не входят JDK и внешние библиотеки)
+
+    private fun collectDependencies(
+        project: Project,
+        targetClass: PsiClass,
+        result: MutableSet<VirtualFile>
+    ) {
         val projectScope = GlobalSearchScope.projectScope(project)
 
         targetClass.accept(object : JavaRecursiveElementWalkingVisitor() {
             override fun visitReferenceElement(reference: PsiJavaCodeReferenceElement) {
                 super.visitReferenceElement(reference)
-                
-                // Пытаемся найти класс, на который ссылаемся
+
                 val resolved = reference.resolve() as? PsiClass ?: return
-                
-                // Пропускаем сам себя
+
                 if (resolved == targetClass) return
 
                 val virtualFile = resolved.containingFile?.virtualFile ?: return
 
-                // ГЛАВНЫЙ ФИЛЬТР: добавляем файл, только если он принадлежит проекту
                 if (projectScope.contains(virtualFile)) {
                     addFile(virtualFile, result)
                 }
