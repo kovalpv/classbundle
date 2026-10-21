@@ -10,6 +10,8 @@ import com.intellij.psi.search.searches.ClassInheritorsSearch
 import com.intellij.psi.search.searches.ReferencesSearch
 import io.github.kovalpv.classbundle.model.ExportRequest
 import io.github.kovalpv.classbundle.model.RelationType
+import com.intellij.psi.JavaRecursiveElementWalkingVisitor
+import com.intellij.psi.PsiJavaCodeReferenceElement
 
 /**
  * Сборка списка связанных файлов (FR-4, FR-5, FR-6, FR-7, SDD §9).
@@ -58,6 +60,8 @@ internal class RelatedFilesCollector {
                     RelationType.USAGE -> collectUsages(targetClass, scope, result)
                     RelationType.INHERITOR -> collectInheritors(targetClass, scope, result)
                     RelationType.NESTED -> collectNested(targetClass, result)
+                    // RelationType.DEPENDENCY -> collectDependencies(targetClass, result) 
+                    RelationType.DEPENDENCY -> collectDependencies(project, targetClass, result)
                 }
             } catch (e: Exception) {
                 // PSI error (invalid element) → logger.warn, skip (SDD §9)
@@ -105,4 +109,28 @@ internal class RelatedFilesCollector {
         } catch (e: Exception) {
             "unknown"
         }
+    
+        private fun collectDependencies(project: Project, targetClass: PsiClass, result: MutableSet<VirtualFile>) {
+        // Получаем скоуп проекта (в него не входят JDK и внешние библиотеки)
+        val projectScope = GlobalSearchScope.projectScope(project)
+
+        targetClass.accept(object : JavaRecursiveElementWalkingVisitor() {
+            override fun visitReferenceElement(reference: PsiJavaCodeReferenceElement) {
+                super.visitReferenceElement(reference)
+                
+                // Пытаемся найти класс, на который ссылаемся
+                val resolved = reference.resolve() as? PsiClass ?: return
+                
+                // Пропускаем сам себя
+                if (resolved == targetClass) return
+
+                val virtualFile = resolved.containingFile?.virtualFile ?: return
+
+                // ГЛАВНЫЙ ФИЛЬТР: добавляем файл, только если он принадлежит проекту
+                if (projectScope.contains(virtualFile)) {
+                    addFile(virtualFile, result)
+                }
+            }
+        })
+    }
 }

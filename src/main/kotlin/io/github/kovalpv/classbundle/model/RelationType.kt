@@ -13,4 +13,5 @@ enum class RelationType {
     USAGE,
     INHERITOR,
     NESTED,
+    DEPENDENCY,
 }

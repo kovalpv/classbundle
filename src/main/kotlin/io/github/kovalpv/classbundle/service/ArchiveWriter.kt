@@ -61,7 +61,7 @@ internal class ArchiveWriter {
         }
     }
 
-    private fun writeFiles(zip: ZipOutputStream, request: ExportRequest, files: List<VirtualFile>) {
+        private fun writeFiles(zip: ZipOutputStream, request: ExportRequest, files: List<VirtualFile>) {
         val usedEntries = LinkedHashSet<String>()
         val skipped = mutableListOf<String>()
         for (file in files) {
@@ -72,7 +72,12 @@ internal class ArchiveWriter {
             }
             val entryName = uniqueEntry(usedEntries, entryName(file, request.projectBasePath))
             zip.putNextEntry(ZipEntry(entryName))
-            zip.write(file.contentsToByteArray())
+            
+            // ИСПРАВЛЕНО: Потоковое копирование вместо загрузки в память (AGENTS.md)
+            java.nio.file.Files.newInputStream(file.toNioPath()).use { input ->
+                input.copyTo(zip)
+            }
+            
             zip.closeEntry()
         }
         if (skipped.isNotEmpty()) {

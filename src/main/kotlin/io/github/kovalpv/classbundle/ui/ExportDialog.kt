@@ -1,197 +1,469 @@
 package io.github.kovalpv.classbundle.ui
 
-import com.intellij.openapi.application.ApplicationManager
-import com.intellij.openapi.fileChooser.FileChooser
-import com.intellij.openapi.fileChooser.FileChooserDescriptor
+import com.intellij.ide.bookmark.BookmarkType
+import com.intellij.ide.bookmark.BookmarksManager
+import com.intellij.notification.NotificationGroupManager
+import com.intellij.notification.NotificationType
+import com.intellij.openapi.application.ModalityState
+import com.intellij.openapi.application.ReadAction
+import com.intellij.openapi.application.runReadAction
+import com.intellij.openapi.fileChooser.FileChooserFactory
+import com.intellij.openapi.fileChooser.FileSaverDescriptor
 import com.intellij.openapi.progress.ProgressIndicator
+import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.Project
-import com.intellij.openapi.ui.ComboBox
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.Messages
-import com.intellij.psi.PsiClass
-import com.intellij.psi.PsiElement
-import com.intellij.psi.PsiNamedElement
-import com.intellij.psi.util.PsiTreeUtil
+import com.intellij.openapi.ui.TextFieldWithBrowseButton
+import com.intellij.openapi.vfs.LocalFileSystem
 import com.intellij.openapi.vfs.VirtualFile
-import com.intellij.ui.components.JBCheckBox
+import com.intellij.psi.JavaPsiFacade
+import com.intellij.psi.PsiClass
+import com.intellij.psi.PsiManager
+import com.intellij.psi.search.GlobalSearchScope
+import com.intellij.psi.util.PsiTreeUtil
 import com.intellij.ui.components.JBLabel
-import com.intellij.ui.components.JBTextField
+import com.intellij.ui.components.JBList
+import com.intellij.util.concurrency.AppExecutorUtil
 import io.github.kovalpv.classbundle.ClassBundleBundle
 import io.github.kovalpv.classbundle.model.ArchiveMode
 import io.github.kovalpv.classbundle.model.ExportRequest
-import io.github.kovalpv.classbundle.model.ExportResult
 import io.github.kovalpv.classbundle.model.PathMode
 import io.github.kovalpv.classbundle.model.RelationType
-import io.github.kovalpv.classbundle.service.ArchiveWriter
+import io.github.kovalpv.classbundle.service.ExportPreferences
+import io.github.kovalpv.classbundle.service.ExportService
 import io.github.kovalpv.classbundle.service.RelatedFilesCollector
 import java.awt.BorderLayout
 import java.awt.Dimension
+import java.awt.GridLayout
+import java.awt.event.ActionEvent
 import java.io.File
-import java.nio.file.Paths
-import javax.swing.Box
-import javax.swing.BoxLayout
-import javax.swing.JButton
-import javax.swing.JComponent
-import javax.swing.JPanel
+import java.util.concurrent.Callable
+import javax.swing.*
+import javax.swing.event.DocumentEvent
+import javax.swing.event.DocumentListener
 
-class ExportDialog(
+internal class ExportDialog(
     private val project: Project,
-    private val context: PsiElement
+    private val className: String,
 ) : DialogWrapper(project) {
 
-    private val relationsCheckBoxes = RelationType.entries.associateWith { relation ->
-        JBCheckBox(relationName(relation), relation in setOf(RelationType.USAGE, RelationType.INHERITOR))
+    private val collector = RelatedFilesCollector()
+
+    private val usageCheckbox = JCheckBox(ClassBundleBundle.message("relation.usages"))
+    private val inheritorsCheckbox = JCheckBox(ClassBundleBundle.message("relation.inheritors"))
+    private val nestedCheckbox = JCheckBox(ClassBundleBundle.message("relation.nested"))
+    private val selfCheckbox = JCheckBox(ClassBundleBundle.message("relation.self")).apply {
+        isSelected = true
+        isEnabled = false
+    }
+    private val dependencyCheckbox = JCheckBox(ClassBundleBundle.message("relation.dependencies"))
+
+    private val relativeRadio = JRadioButton(ClassBundleBundle.message("path.relative"))
+    private val absoluteRadio = JRadioButton(ClassBundleBundle.message("path.absolute"))
+
+    private val filesRadio = JRadioButton(ClassBundleBundle.message("archive.files"))
+    private val pathsRadio = JRadioButton(ClassBundleBundle.message("archive.paths"))
+
+    private val outputPathField = TextFieldWithBrowseButton()
+
+    private val previewList = JBList<String>(listOf())
+    private val previewCountLabel = JBLabel()
+
+    private val targetClass: PsiClass? by lazy {
+        runReadAction {
+            JavaPsiFacade.getInstance(project).findClass(
+                className,
+                GlobalSearchScope.projectScope(project)
+            )
+        }
     }
 
-    private val archiveModeCombo = ComboBox(ArchiveMode.entries.map { archiveModeName(it) }.toTypedArray())
-
-    private val pathModeCombo = ComboBox(PathMode.entries.map { pathModeName(it) }.toTypedArray())
-    private val outputPathField = JBTextField()
-    private val browseButton = JButton()
-    private var exportResult: ExportResult? = null
-
     init {
-        title = ClassBundleBundle.message("export.dialog.title")
-        browseButton.text = ClassBundleBundle.message("export.dialog.browse")
-        browseButton.addActionListener { browseForOutputFile() }
-        init()
+        title = ClassBundleBundle.message("dialog.title")
+
+        // 1. Инициализация настроек из ExportPreferences (FR-12)
+        val prefs = ExportPreferences
+        usageCheckbox.isSelected = RelationType.USAGE in prefs.selectedRelations
+        inheritorsCheckbox.isSelected = RelationType.INHERITOR in prefs.selectedRelations
+        nestedCheckbox.isSelected = RelationType.NESTED in prefs.selectedRelations
+
+        relativeRadio.isSelected = prefs.pathMode == PathMode.RELATIVE
+        absoluteRadio.isSelected = prefs.pathMode == PathMode.ABSOLUTE
+
+        filesRadio.isSelected = prefs.archiveMode == ArchiveMode.FILES
+        pathsRadio.isSelected = prefs.archiveMode == ArchiveMode.PATH_LIST
+
+        // 2. Установка начального пути
+        val dir = prefs.outputDir.ifBlank { project.basePath ?: "" }
+        outputPathField.text = if (dir.isNotBlank()) {
+            "$dir${File.separator}${prefs.filePattern}"
+        } else {
+            ""
+        }
+
+        // 3. Кастомный обработчик для кнопки "Browse..." (Обзор)
+        outputPathField.button.addActionListener {
+            val currentText = outputPathField.text.trim()
+            val currentFile = if (currentText.isNotEmpty()) File(currentText) else null
+
+            // Создаем диалог сохранения (Save File)
+            val descriptor = FileSaverDescriptor(
+                ClassBundleBundle.message("export.fileChooser.title"),
+                "Select a path to save the exported Class Bundle",
+                "zip"
+            )
+            val dialog = FileChooserFactory.getInstance().createSaveFileDialog(descriptor, project)
+
+            // Берем текущую директорию и имя файла из текстового поля
+            val initialDir = currentFile?.parentFile?.let {
+                LocalFileSystem.getInstance().findFileByIoFile(it)
+            }
+            val initialName = currentFile?.name ?: "classbundle.zip"
+
+            val wrapper = dialog.save(initialDir, initialName)
+            if (wrapper != null) {
+                var path = wrapper.file.absolutePath
+                // Принудительно добавляем расширение .zip, если его нет
+                if (!path.endsWith(".zip", ignoreCase = true)) {
+                    path += ".zip"
+                }
+                outputPathField.text = path
+                updateOkState()
+            }
+        }
+
+        // 4. Слушатель ручного ввода (чтобы кнопка OK реагировала на изменения)
+        outputPathField.textField.document.addDocumentListener(object : DocumentListener {
+            override fun insertUpdate(e: DocumentEvent) = updateOkState()
+            override fun removeUpdate(e: DocumentEvent) = updateOkState()
+            override fun changedUpdate(e: DocumentEvent) = updateOkState()
+        })
+
+        // 5. Вызываем super.init() в самом конце
+        super.init()
+    }
+
+    // Вспомогательный метод
+    private fun updateOkState() {
+        isOKActionEnabled = canExport()
     }
 
     override fun createCenterPanel(): JComponent {
-        val panel = JPanel(BorderLayout())
-        val top = JPanel()
-        top.add(JBLabel(ClassBundleBundle.message("export.dialog.target.label")))
-        
-        val psiClass = context as? com.intellij.psi.PsiClass
-        val targetName = psiClass?.qualifiedName 
-            ?: (context as? com.intellij.psi.PsiNamedElement)?.name 
-            ?: context.text
-
-        top.add(JBLabel(targetName))
-        top.add(Box.createHorizontalGlue())
-        panel.add(top, BorderLayout.NORTH)
-
-        val centerPanel = JPanel()
-        centerPanel.layout = BoxLayout(centerPanel, BoxLayout.Y_AXIS)
-        centerPanel.add(JBLabel(ClassBundleBundle.message("export.dialog.relations.label")))
-        relationsCheckBoxes.values.forEach { checkbox ->
-            centerPanel.add(Box.createVerticalStrut(4))
-            centerPanel.add(checkbox)
-        }
-        centerPanel.add(Box.createVerticalStrut(12))
-        centerPanel.add(JBLabel(ClassBundleBundle.message("export.dialog.archiveMode.label")))
-        centerPanel.add(Box.createVerticalStrut(4))
-        centerPanel.add(archiveModeCombo)
-        centerPanel.add(Box.createVerticalStrut(12))
-        centerPanel.add(JBLabel(ClassBundleBundle.message("export.dialog.pathMode.label")))
-        centerPanel.add(Box.createVerticalStrut(4))
-        centerPanel.add(pathModeCombo)
-        centerPanel.add(Box.createVerticalStrut(12))
-        centerPanel.add(JBLabel(ClassBundleBundle.message("export.dialog.outputFile.label")))
-        centerPanel.add(Box.createVerticalStrut(4))
-        val pathRow = JPanel()
-        pathRow.add(outputPathField)
-        pathRow.add(browseButton)
-        centerPanel.add(pathRow)
-
-        panel.add(centerPanel, BorderLayout.CENTER)
-        panel.preferredSize = Dimension(480, 420)
-        return panel
+        val content = JPanel(BorderLayout(0, 8))
+        content.add(createOptionsPanel(), BorderLayout.CENTER)
+        content.add(createPreviewPanel(), BorderLayout.SOUTH)
+        attachPreviewListeners()
+        isOKActionEnabled = canExport()
+        refreshPreview()
+        return content
     }
 
-    private fun browseForOutputFile() {
-        val descriptor = FileChooserDescriptor(true, false, false, false, false, false)
-        descriptor.setTitle(ClassBundleBundle.message("export.fileChooser.title"))
-        val chosen: VirtualFile = FileChooser.chooseFile(descriptor, project, null) ?: return
-        outputPathField.text = chosen.path
-    }
+    override fun doOKAction() {
+        if (!canExport()) return
 
-    private fun selectedRelations(): Set<RelationType> =
-        relationsCheckBoxes.filter { (_, checkbox) -> checkbox.isSelected }.keys
+        // Сохраняем настройки перед запуском (FR-12)
+        val prefs = ExportPreferences
+        prefs.selectedRelations = selectedRelations()
+        prefs.pathMode = if (relativeRadio.isSelected) PathMode.RELATIVE else PathMode.ABSOLUTE
+        prefs.archiveMode = if (filesRadio.isSelected) ArchiveMode.FILES else ArchiveMode.PATH_LIST
 
-    private fun buildRequest(targetClass: PsiClass): ExportRequest {
-        val output = outputPathField.text?.trim().orEmpty()
-        if (output.isEmpty()) {
-            Messages.showErrorDialog(
-                project,
-                ClassBundleBundle.message("export.error.outputPath"),
-                ClassBundleBundle.message("export.error.outputPath.title"),
-            )
-            throw IllegalStateException("Output path is not specified")
+        val outputFile = File(outputPathField.text.trim())
+        outputFile.parent?.let { prefs.outputDir = it }
+        prefs.filePattern = outputFile.name
+
+        val request = try {
+            buildRequest()
+        } catch (e: IllegalStateException) {
+            notifyError(e.message ?: ClassBundleBundle.message("export.error.noFiles"))
+            return
         }
-        return ExportRequest(
-            project = project,
-            targetClass = targetClass,
-            relations = selectedRelations(),
-            archiveMode = ArchiveMode.entries[archiveModeCombo.selectedIndex],
-            pathMode = PathMode.entries[pathModeCombo.selectedIndex],
-            outputZip = Paths.get(output),
+
+        super.doOKAction() // сначала закрываем диалог
+
+        ProgressManager.getInstance().run(
+            object : Task.Backgroundable(project, "Exporting classes", true) {
+                override fun run(indicator: ProgressIndicator) {
+                    try {
+                        ExportService.export(request, indicator)
+                    } catch (e: Exception) {
+                        notifyError(e.message ?: "Export failed")
+                    }
+                }
+            }
         )
     }
 
-    fun doExport(): Boolean {
-        val targetClass = context.let { element ->
-            if (element is PsiClass) element else PsiTreeUtil.getParentOfType(context, PsiClass::class.java)
-        }
-        if (targetClass == null) {
-            Messages.showErrorDialog(
-                project,
-                ClassBundleBundle.message("export.error.noClass"),
-                ClassBundleBundle.message("export.error.noClass.title"),
-            )
-            return false
-        }
-
-        val request = try {
-            buildRequest(targetClass)
-        } catch (exception: IllegalStateException) {
-            return false
-        }
-
-        object : Task.Backgroundable(project, ClassBundleBundle.message("export.progress.title"), true) {
-            override fun run(indicator: ProgressIndicator) {
-                val collector = RelatedFilesCollector()
-                val files = collector.collect(request)
-                val result = ArchiveWriter().write(request, files)
-                exportResult = result
-                ApplicationManager.getApplication().invokeLater {
-                    if (result.success) {
-                        Messages.showInfoMessage(
-                            project,
-                            ClassBundleBundle.message("export.success", result.exportedCount, result.archivePath),
-                            ClassBundleBundle.message("export.success.title"),
-                        )
-                    } else {
-                        Messages.showErrorDialog(
-                            project,
-                            result.errorMessage ?: ClassBundleBundle.message("export.failure.unknown"),
-                            ClassBundleBundle.message("export.failure.title"),
-                        )
-                    }
-                    close(OK_EXIT_CODE)
+    override fun createLeftSideActions(): Array<Action> {
+        val addToFavoritesAction =
+            object : AbstractAction(ClassBundleBundle.message("action.addToFavorites")) {
+                override fun actionPerformed(e: ActionEvent?) {
+                    addToFavorites()
                 }
             }
-        }.queue()
-        return true
+        return arrayOf(addToFavoritesAction)
     }
 
-    private fun relationName(relation: RelationType): String =
-        when (relation) {
-            RelationType.USAGE -> ClassBundleBundle.message("export.relation.USAGE")
-            RelationType.INHERITOR -> ClassBundleBundle.message("export.relation.INHERITOR")
-            RelationType.NESTED -> ClassBundleBundle.message("export.relation.NESTED")
+    private fun addToFavorites() {
+        val relations = selectedRelations()
+        val cls = targetClass ?: return
+
+        if (relations.isEmpty()) {
+            notifyError(ClassBundleBundle.message("export.error.noFiles"))
+            return
         }
 
-    private fun archiveModeName(archiveMode: ArchiveMode): String =
-        when (archiveMode) {
-            ArchiveMode.FILES -> ClassBundleBundle.message("export.archiveMode.FILES")
-            ArchiveMode.PATH_LIST -> ClassBundleBundle.message("export.archiveMode.PATHS")
+        val defaultName = className.substringAfterLast('.').ifBlank { "ClassBundle" }
+
+        val listName = Messages.showInputDialog(
+            project,
+            ClassBundleBundle.message("dialog.favorites.prompt"),
+            ClassBundleBundle.message("dialog.favorites.title"),
+            Messages.getQuestionIcon(),
+            defaultName,
+            null
+        ) ?: return
+
+        if (listName.isBlank()) return
+
+        ReadAction.nonBlocking(Callable<List<VirtualFile>> {
+            RelatedFilesCollector().collect(project, cls, relations)
+        })
+            .inSmartMode(project)
+            .finishOnUiThread(ModalityState.any()) { files ->
+                if (files.isEmpty()) {
+                    notifyError(ClassBundleBundle.message("export.error.noFiles"))
+                    return@finishOnUiThread
+                }
+
+                try {
+                    val bookmarksManager =
+                        BookmarksManager.getInstance(project) ?: return@finishOnUiThread
+
+                    // 1. Получаем или создаем группу
+                    var group = bookmarksManager.getGroup(listName)
+                    if (group == null) {
+                        group = bookmarksManager.addGroup(listName, true)
+                    }
+
+                    if (group == null) return@finishOnUiThread
+
+                    // 2. ОЧИСТКА ГРУППЫ: Удаляем старые закладки из этой группы (пересоздаем)
+                    val allBookmarks = bookmarksManager.bookmarks
+                    for (bookmark in allBookmarks) {
+                        if (bookmarksManager.getGroups(bookmark).contains(group)) {
+                            bookmarksManager.remove(bookmark)
+                        }
+                    }
+
+                    // 3. Сортируем файлы по полному имени класса
+                    val sortedFiles = files.sortedBy { file ->
+                        val psiFile = PsiManager.getInstance(project).findFile(file)
+                        val psiClass =
+                            psiFile?.let { PsiTreeUtil.findChildOfType(it, PsiClass::class.java) }
+                        psiClass?.qualifiedName ?: file.name
+                    }
+
+                    // 4. Вычисляем общий префикс пакетов
+                    val commonPrefix = getCommonPackagePrefix(project, sortedFiles)
+
+                    // 5. Добавляем закладки с укороченными именами
+                    for (file in sortedFiles) {
+                        val bookmark = bookmarksManager.createBookmark(file)
+                        if (bookmark != null) {
+                            val psiFile = PsiManager.getInstance(project).findFile(file)
+                            val psiClass = psiFile?.let {
+                                PsiTreeUtil.findChildOfType(
+                                    it,
+                                    PsiClass::class.java
+                                )
+                            }
+                            val qualifiedName = psiClass?.qualifiedName ?: file.name
+
+                            // Обрезаем общий префикс (например, com.center2m.iem.getemon.)
+                            val description =
+                                if (commonPrefix.isNotEmpty() && qualifiedName.startsWith(
+                                        commonPrefix
+                                    )
+                                ) {
+                                    qualifiedName.removePrefix(commonPrefix)
+                                } else {
+                                    qualifiedName
+                                }
+
+                            group.add(bookmark, BookmarkType.DEFAULT, description)
+                        }
+                    }
+
+                    NotificationGroupManager.getInstance()
+                        .getNotificationGroup("ClassBundle")
+                        .createNotification(
+                            ClassBundleBundle.message(
+                                "notification.favorites.success",
+                                files.size,
+                                listName
+                            ),
+                            NotificationType.INFORMATION
+                        )
+                        .notify(project)
+
+                } catch (e: Exception) {
+                    notifyError("Failed to add to bookmarks: ${e.message}")
+                }
+            }
+            .submit(AppExecutorUtil.getAppExecutorService())
+    }
+
+    // Вспомогательный метод для поиска общего префикса пакетов
+    private fun getCommonPackagePrefix(project: Project, files: List<VirtualFile>): String {
+        val packages = files.mapNotNull { file ->
+            val psiFile = PsiManager.getInstance(project).findFile(file)
+            val psiClass = psiFile?.let { PsiTreeUtil.findChildOfType(it, PsiClass::class.java) }
+            psiClass?.qualifiedName?.substringBeforeLast('.')
+        }.distinct()
+
+        if (packages.size <= 1) return "" // Если пакет один, не обрезаем его
+
+        val splitPackages = packages.map { it.split('.') }
+        val first = splitPackages.first()
+        var prefixLength = 0
+
+        for (i in first.indices) {
+            if (splitPackages.all { it.size > i && it[i] == first[i] }) {
+                prefixLength++
+            } else {
+                break
+            }
         }
 
-    private fun pathModeName(pathMode: PathMode): String =
-        when (pathMode) {
-            PathMode.RELATIVE -> ClassBundleBundle.message("export.pathMode.RELATIVE")
-            PathMode.ABSOLUTE -> ClassBundleBundle.message("export.pathMode.ABSOLUTE")
+        return if (prefixLength > 0) first.take(prefixLength).joinToString(".") + "." else ""
+    }
+
+    private fun createOptionsPanel(): JPanel {
+        val includePanel = JPanel(GridLayout(0, 1, 0, 4))
+        includePanel.add(usageCheckbox)
+        includePanel.add(inheritorsCheckbox)
+        includePanel.add(nestedCheckbox)
+        includePanel.add(dependencyCheckbox)
+        includePanel.add(selfCheckbox)
+
+        val pathPanel = JPanel(GridLayout(0, 1, 0, 4))
+        pathPanel.add(relativeRadio)
+        pathPanel.add(absoluteRadio)
+        val pathGroup = ButtonGroup()
+        pathGroup.add(relativeRadio)
+        pathGroup.add(absoluteRadio)
+
+        val archivePanel = JPanel(GridLayout(0, 1, 0, 4))
+        archivePanel.add(filesRadio)
+        archivePanel.add(pathsRadio)
+        val archiveGroup = ButtonGroup()
+        archiveGroup.add(filesRadio)
+        archiveGroup.add(pathsRadio)
+
+        val outputPanel = JPanel(BorderLayout(8, 0))
+        outputPanel.add(JBLabel(ClassBundleBundle.message("output.label")), BorderLayout.WEST)
+        outputPanel.add(outputPathField, BorderLayout.CENTER)
+
+        val box = JPanel().apply { layout = BoxLayout(this, BoxLayout.Y_AXIS) }
+        for (panel in listOf(includePanel, pathPanel, archivePanel, outputPanel)) {
+            box.add(panel)
+            box.add(Box.createVerticalStrut(10))
         }
+        return box
+    }
+
+    private fun createPreviewPanel(): JComponent {
+        previewList.isEnabled = false
+        previewList.emptyText.text = ClassBundleBundle.message("preview.empty")
+        previewCountLabel.text = ClassBundleBundle.message("preview.count", 0)
+        val panel = JPanel(BorderLayout(0, 4))
+        panel.add(previewCountLabel, BorderLayout.NORTH)
+        val scroll = JScrollPane(previewList)
+        scroll.preferredSize = Dimension(scroll.preferredSize.width, 180)
+        panel.add(scroll, BorderLayout.CENTER)
+        return panel
+    }
+
+    private fun canExport(): Boolean =
+        outputPathField.text.isNotBlank() && targetClass != null && selectedRelations().isNotEmpty()
+
+    private fun attachPreviewListeners() {
+        val listener = java.awt.event.ItemListener { _ ->
+            isOKActionEnabled = canExport()
+            refreshPreview()
+        }
+        for (component in listOf(
+            usageCheckbox, inheritorsCheckbox, nestedCheckbox,
+            relativeRadio, absoluteRadio, filesRadio, pathsRadio
+        )) {
+            component.addItemListener(listener)
+        }
+    }
+
+    // ИСПРАВЛЕНО: Прямой опрос чекбоксов вместо хака с valueOf
+    private fun selectedRelations(): Set<RelationType> = buildSet {
+        if (usageCheckbox.isSelected) add(RelationType.USAGE)
+        if (inheritorsCheckbox.isSelected) add(RelationType.INHERITOR)
+        if (nestedCheckbox.isSelected) add(RelationType.NESTED)
+        if (dependencyCheckbox.isSelected) add(RelationType.DEPENDENCY)
+    }
+
+    private fun buildRequest(): ExportRequest {
+        val cls = targetClass
+        checkNotNull(cls) { "Target class '$className' not found in project" }
+        val pathMode = if (relativeRadio.isSelected) PathMode.RELATIVE else PathMode.ABSOLUTE
+
+        // ИСПРАВЛЕНО: Прямое использование константы PATH_LIST
+        val archiveMode = if (filesRadio.isSelected) ArchiveMode.FILES else ArchiveMode.PATH_LIST
+
+        val outputZip = File(outputPathField.text.trim()).toPath()
+        return ExportRequest(
+            targetClass = cls,
+            relations = selectedRelations(),
+            pathMode = pathMode,
+            archiveMode = archiveMode,
+            outputZip = outputZip,
+            project = project
+        )
+    }
+
+    private fun refreshPreview() {
+        val relations = selectedRelations()
+        val cls = targetClass
+        if (cls == null || relations.isEmpty()) {
+            previewList.setListData(arrayOf())
+            previewCountLabel.text = ClassBundleBundle.message("preview.count", 0)
+            return
+        }
+
+        ReadAction.nonBlocking(Callable<List<String>> {
+            val previewResult = ExportService.preview(project, cls, relations)
+            previewResult.files.map { it.toString() }
+        })
+            .inSmartMode(project)
+            .coalesceBy(this)
+            .finishOnUiThread(ModalityState.any()) { fileNames ->
+                previewList.setListData(fileNames.toTypedArray())
+                previewCountLabel.text = ClassBundleBundle.message("preview.count", fileNames.size)
+            }
+            .submit(AppExecutorUtil.getAppExecutorService())
+    }
+
+    private fun notifyError(message: String) {
+        try {
+            // ИСПРАВЛЕНО: ID группы нотификаций приведен в соответствие с plugin.xml
+            NotificationGroupManager.getInstance()
+                .getNotificationGroup("ClassBundle")
+                .createNotification(
+                    ClassBundleBundle.message("notification.error.title"),
+                    message,
+                    NotificationType.ERROR
+                )
+                .notify(project)
+        } catch (e: Exception) {
+            // Фоллбек
+        }
+    }
 }
