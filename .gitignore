@@ -3,8 +3,11 @@ build/
 out/
 bin/
 
+.gradle/
+
 # IDE
 .idea/
+.intellijPlatform/
 *.iml
 *.ipr
 *.iws

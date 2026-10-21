@@ -1,0 +1,27 @@
+<idea-plugin>
+    <id>io.github.kovalpv.classbundle</id>
+    <name>ClassBundle — Export Related Files</name>
+    <vendor>kovalpv</vendor>
+
+    <description><![CDATA[
+        Collect files related to a Java class (usages, inheritors, nested classes)
+        and export them to a ZIP archive — either the files themselves or a text
+        list of paths. Useful for building minimal repro cases for bug reports.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.java</depends>
+    <depends>com.intellij.java</depends>
+    
+    <resource-bundle>messages.ClassBundleBundle</resource-bundle>
+
+    <actions>
+        <action id="ClassBundle.ExportClassBundle"
+                class="io.github.kovalpv.classbundle.action.ExportClassBundleAction"
+                text="action.exportClassBundle"
+                description="action.exportClassBundle.description">
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+        </action>
+    </actions>
+</idea-plugin>
