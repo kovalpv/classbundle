@@ -1,0 +1,23 @@
+# Build output
+build/
+out/
+bin/
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+
+# Local config
+local.properties
+gradle/wrapper/gradle-wrapper.properties.local
+
+# Logs and caches
+*.log
+.kotlin/
+
+# OS
+.DS_Store
+Thumbs.db
