@@ -31,12 +31,7 @@ import com.intellij.ui.components.JBTextField
 import com.intellij.util.Alarm
 import com.intellij.util.concurrency.AppExecutorUtil
 import io.github.kovalpv.classbundle.ClassBundleBundle
-import io.github.kovalpv.classbundle.model.ContextFormat
-import io.github.kovalpv.classbundle.model.ExportPreview
-import io.github.kovalpv.classbundle.model.ExportRequest
-import io.github.kovalpv.classbundle.model.OutputMode
-import io.github.kovalpv.classbundle.model.PathMode
-import io.github.kovalpv.classbundle.model.RelationType
+import io.github.kovalpv.classbundle.model.*
 import io.github.kovalpv.classbundle.service.ExportPreferences
 import io.github.kovalpv.classbundle.service.ExportService
 import io.github.kovalpv.classbundle.service.RelatedFilesCollector
@@ -48,17 +43,7 @@ import java.awt.event.ActionEvent
 import java.awt.event.ActionListener
 import java.io.File
 import java.util.concurrent.Callable
-import javax.swing.AbstractAction
-import javax.swing.Box
-import javax.swing.BoxLayout
-import javax.swing.ButtonGroup
-import javax.swing.DefaultListCellRenderer
-import javax.swing.JCheckBox
-import javax.swing.JComboBox
-import javax.swing.JComponent
-import javax.swing.JPanel
-import javax.swing.JRadioButton
-import javax.swing.JScrollPane
+import javax.swing.*
 import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
 
@@ -82,6 +67,8 @@ internal class ExportDialog(
         isEnabled = false
     }
     private val dependencyCheckbox = JCheckBox(ClassBundleBundle.message("relation.dependencies"))
+    private val transitiveDependencyCheckbox =
+        JCheckBox(ClassBundleBundle.message("relation.dependencies.transitive"))
 
     private val relativeRadio = JRadioButton(ClassBundleBundle.message("path.relative"))
     private val absoluteRadio = JRadioButton(ClassBundleBundle.message("path.absolute"))
@@ -130,6 +117,8 @@ internal class ExportDialog(
         inheritorsCheckbox.isSelected = RelationType.INHERITOR in prefs.selectedRelations
         nestedCheckbox.isSelected = RelationType.NESTED in prefs.selectedRelations
         dependencyCheckbox.isSelected = RelationType.DEPENDENCY in prefs.selectedRelations
+        transitiveDependencyCheckbox.isSelected =
+            RelationType.TRANSITIVE_DEPENDENCY in prefs.selectedRelations
 
         relativeRadio.isSelected = prefs.pathMode == PathMode.RELATIVE
         absoluteRadio.isSelected = prefs.pathMode == PathMode.ABSOLUTE
@@ -382,6 +371,7 @@ internal class ExportDialog(
         includePanel.add(inheritorsCheckbox)
         includePanel.add(nestedCheckbox)
         includePanel.add(dependencyCheckbox)
+        includePanel.add(transitiveDependencyCheckbox)
         includePanel.add(selfCheckbox)
 
         val pathPanel = JPanel(GridLayout(0, 1, 0, 4))
@@ -440,7 +430,8 @@ internal class ExportDialog(
     private fun attachPreviewListeners() {
         val listener = ActionListener { invalidatePreview() }
         for (component in listOf(
-            usageCheckbox, inheritorsCheckbox, nestedCheckbox, dependencyCheckbox,
+            usageCheckbox, inheritorsCheckbox, nestedCheckbox,
+            dependencyCheckbox, transitiveDependencyCheckbox,
             relativeRadio, absoluteRadio,
         )) {
             component.addActionListener(listener)
@@ -546,6 +537,7 @@ internal class ExportDialog(
         if (inheritorsCheckbox.isSelected) add(RelationType.INHERITOR)
         if (nestedCheckbox.isSelected) add(RelationType.NESTED)
         if (dependencyCheckbox.isSelected) add(RelationType.DEPENDENCY)
+        if (transitiveDependencyCheckbox.isSelected) add(RelationType.TRANSITIVE_DEPENDENCY)
     }
 
     private fun selectedOutputMode(): OutputMode = when {
@@ -560,6 +552,7 @@ internal class ExportDialog(
     private fun currentExtension(): String = when (selectedOutputMode()) {
         OutputMode.CONTEXT_FILE ->
             (contextFormatCombo.selectedItem as? ContextFormat ?: ContextFormat.MARKDOWN).extension
+
         else -> "zip"
     }
 
@@ -599,6 +592,7 @@ internal class ExportDialog(
             OutputMode.CONTEXT_FILE ->
                 if (raw.endsWith(".${format.extension}", ignoreCase = true)) File(raw)
                 else File("$raw.${format.extension}")
+
             else ->
                 if (raw.endsWith(".zip", ignoreCase = true)) File(raw)
                 else File("$raw.zip")

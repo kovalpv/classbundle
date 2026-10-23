@@ -57,14 +57,25 @@ internal class RelatedFilesCollector {
         targetClass.containingFile?.virtualFile?.let { addFile(it, FileRole.TARGET, result) }
 
         val scope = GlobalSearchScope.projectScope(project)
+        val hasTransitive = RelationType.TRANSITIVE_DEPENDENCY in relations
 
         relations.forEach { relation ->
             try {
                 when (relation) {
-                    RelationType.USAGE -> collectUsages(targetClass, scope, result)
-                    RelationType.INHERITOR -> collectInheritors(targetClass, scope, result)
-                    RelationType.NESTED -> collectNested(targetClass, result)
-                    RelationType.DEPENDENCY -> collectDependencies(project, targetClass, result)
+                    RelationType.USAGE ->
+                        collectUsages(targetClass, scope, result)
+                    RelationType.INHERITOR ->
+                        collectInheritors(targetClass, scope, result)
+                    RelationType.NESTED ->
+                        collectNested(targetClass, result)
+                    RelationType.DEPENDENCY ->
+                        if (!hasTransitive) {
+                            // Если выбрана транзитивная зависимость, прямой поиск
+                            // не запускаем — она включает прямые как подмножество.
+                            collectDirectDependencies(project, targetClass, result)
+                        }
+                    RelationType.TRANSITIVE_DEPENDENCY ->
+                        collectTransitiveDependencies(project, targetClass, scope, result)
                 }
             } catch (e: ProcessCanceledException) {
                 throw e
@@ -109,7 +120,8 @@ internal class RelatedFilesCollector {
         }
     }
 
-    private fun collectDependencies(
+    /** Прямые зависимости целевого класса: один уровень ссылок. */
+    private fun collectDirectDependencies(
         project: Project,
         targetClass: PsiClass,
         result: MutableMap<VirtualFile, FileRole>,
@@ -118,18 +130,8 @@ internal class RelatedFilesCollector {
         targetClass.accept(object : JavaRecursiveElementWalkingVisitor() {
             override fun visitReferenceElement(reference: PsiJavaCodeReferenceElement) {
                 super.visitReferenceElement(reference)
-
-                val resolved: PsiClass? = try {
-                    reference.resolve() as? PsiClass
-                } catch (e: ProcessCanceledException) {
-                    throw e
-                } catch (e: IndexNotReadyException) {
-                    throw e
-                } catch (e: Exception) {
-                    logger.warn("Failed to resolve reference: ${reference.text}", e)
-                    null
-                }
-                if (resolved == null || resolved == targetClass) return
+                val resolved = resolveOrNull(reference) ?: return
+                if (resolved == targetClass) return
 
                 val virtualFile = resolved.containingFile?.virtualFile ?: return
                 if (projectScope.contains(virtualFile)) {
@@ -139,7 +141,82 @@ internal class RelatedFilesCollector {
         })
     }
 
-    private fun addFile(file: VirtualFile?, role: FileRole, result: MutableMap<VirtualFile, FileRole>) {
+    /**
+     * Транзитивные зависимости: BFS по графу ссылок, начиная с [targetClass].
+     * Включает прямые зависимости как подмножество.
+     *
+     * Ограничения:
+     * - посещаются только классы в [GlobalSearchScope.projectScope];
+     * - защита от «утащить пол-проекта» через [MAX_TRANSITIVE_FILES];
+     * - циклы обрезаются через `visited`.
+     */
+    private fun collectTransitiveDependencies(
+        project: Project,
+        targetClass: PsiClass,
+        scope: GlobalSearchScope,
+        result: MutableMap<VirtualFile, FileRole>,
+    ) {
+        val visited = mutableSetOf<PsiClass>()
+        visited.add(targetClass)
+        val queue = ArrayDeque<PsiClass>()
+        queue.add(targetClass)
+        var filesAdded = 0
+
+        while (queue.isNotEmpty()) {
+            if (filesAdded >= MAX_TRANSITIVE_FILES) {
+                logger.warn(
+                    "Transitive dependency walk stopped at $MAX_TRANSITIVE_FILES files; " +
+                            "consider narrowing relations"
+                )
+                return
+            }
+
+            val current = queue.removeFirst()
+            val refs = mutableListOf<PsiClass>()
+            current.accept(object : JavaRecursiveElementWalkingVisitor() {
+                override fun visitReferenceElement(reference: PsiJavaCodeReferenceElement) {
+                    super.visitReferenceElement(reference)
+                    val resolved = resolveOrNull(reference) ?: return
+                    refs.add(resolved)
+                }
+            })
+
+            for (resolved in refs) {
+                if (!visited.add(resolved)) continue
+                val virtualFile = resolved.containingFile?.virtualFile ?: continue
+                if (!scope.contains(virtualFile)) continue
+
+                val sizeBefore = result.size
+                addFile(virtualFile, FileRole.DEPENDENCY, result)
+                if (result.size > sizeBefore) filesAdded++
+
+                queue.addLast(resolved)
+            }
+        }
+    }
+
+    /**
+     * `reference.resolve()` с изоляцией control-flow и прочих ошибок:
+     * `ProcessCanceledException` и `IndexNotReadyException` пробрасываются,
+     * остальные логируются как `warn` и превращаются в `null`.
+     */
+    private fun resolveOrNull(reference: PsiJavaCodeReferenceElement): PsiClass? =
+        try {
+            reference.resolve() as? PsiClass
+        } catch (e: ProcessCanceledException) {
+            throw e
+        } catch (e: IndexNotReadyException) {
+            throw e
+        } catch (e: Exception) {
+            logger.warn("Failed to resolve reference: ${reference.text}", e)
+            null
+        }
+
+    private fun addFile(
+        file: VirtualFile?,
+        role: FileRole,
+        result: MutableMap<VirtualFile, FileRole>,
+    ) {
         if (file == null || !file.isValid) return
         val existing = result[file]
         if (existing == null || role.priority < existing.priority) {
@@ -153,4 +230,9 @@ internal class RelatedFilesCollector {
         } catch (e: Exception) {
             "unknown"
         }
+
+    private companion object {
+        /** Верхняя граница числа файлов в транзитивном обходе. */
+        private const val MAX_TRANSITIVE_FILES = 5_000
+    }
 }
