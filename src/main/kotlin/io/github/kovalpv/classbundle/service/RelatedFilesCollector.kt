@@ -16,6 +16,7 @@ import io.github.kovalpv.classbundle.model.ExportRequest
 import io.github.kovalpv.classbundle.model.FileRole
 import io.github.kovalpv.classbundle.model.RelatedFile
 import io.github.kovalpv.classbundle.model.RelationType
+import io.github.kovalpv.classbundle.service.RelatedFilesCollector.Companion.MAX_TRANSITIVE_FILES
 
 /**
  * Сборка списка связанных файлов с ролями (FR-4, FR-5, FR-6, FR-7, SDD §9).
@@ -64,16 +65,20 @@ internal class RelatedFilesCollector {
                 when (relation) {
                     RelationType.USAGE ->
                         collectUsages(targetClass, scope, result)
+
                     RelationType.INHERITOR ->
                         collectInheritors(targetClass, scope, result)
+
                     RelationType.NESTED ->
                         collectNested(targetClass, result)
+
                     RelationType.DEPENDENCY ->
                         if (!hasTransitive) {
                             // Если выбрана транзитивная зависимость, прямой поиск
                             // не запускаем — она включает прямые как подмножество.
                             collectDirectDependencies(project, targetClass, result)
                         }
+
                     RelationType.TRANSITIVE_DEPENDENCY ->
                         collectTransitiveDependencies(project, targetClass, scope, result)
                 }

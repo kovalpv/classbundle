@@ -26,6 +26,10 @@ internal class ArchiveWriter {
             "ArchiveWriter does not handle ${request.outputMode}; use ContextBundleWriter"
         }
         val target = request.outputPath
+            ?: return ExportResult.failure(
+                null,
+                "Output path is required for ${request.outputMode.name}"
+            )
         logger.info(
             "Writing archive: mode=${request.outputMode.name}, files=${files.size}, target=$target"
         )

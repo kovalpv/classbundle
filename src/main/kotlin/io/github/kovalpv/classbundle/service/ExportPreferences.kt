@@ -6,23 +6,16 @@ import io.github.kovalpv.classbundle.model.OutputMode
 import io.github.kovalpv.classbundle.model.PathMode
 import io.github.kovalpv.classbundle.model.RelationType
 
-/**
- * Сохранённые настройки экспорта (FR-12).
- *
- * Мигрирует со старых ключей `archiveMode` / `filePattern` (v1.0.x)
- * на `outputMode` / `contextFormat` / `maxTokens`.
- */
 internal object ExportPreferences {
 
     private const val KEY_OUTPUT_MODE = "classbundle.export.outputMode"
     private const val KEY_CONTEXT_FORMAT = "classbundle.export.contextFormat"
+    private const val KEY_COPY_TO_CLIPBOARD = "classbundle.export.copyToClipboard"
     private const val KEY_MAX_TOKENS = "classbundle.export.maxTokens"
     private const val KEY_PATH_MODE = "classbundle.export.pathMode"
     private const val KEY_RELATIONS = "classbundle.export.relations"
     private const val KEY_OUTPUT_DIR = "classbundle.export.outputDir"
     private const val KEY_FILE_PATTERN = "classbundle.export.filePattern"
-
-    // legacy key, мигрируем на KEY_OUTPUT_MODE
     private const val KEY_LEGACY_ARCHIVE_MODE = "classbundle.export.archiveMode"
 
     const val DEFAULT_FILE_PATTERN = "classbundle.zip"
@@ -51,14 +44,15 @@ internal object ExportPreferences {
             ?: ContextFormat.MARKDOWN
         set(value) = props.setValue(KEY_CONTEXT_FORMAT, value.name)
 
+    var copyContextToClipboard: Boolean
+        get() = props.getBoolean(KEY_COPY_TO_CLIPBOARD, false)
+        set(value) = props.setValue(KEY_COPY_TO_CLIPBOARD, value, false)
+
     var maxTokens: Int?
         get() = props.getValue(KEY_MAX_TOKENS)?.toIntOrNull()
         set(value) {
-            if (value == null) {
-                props.unsetValue(KEY_MAX_TOKENS)
-            } else {
-                props.setValue(KEY_MAX_TOKENS, value.toString())
-            }
+            if (value == null) props.unsetValue(KEY_MAX_TOKENS)
+            else props.setValue(KEY_MAX_TOKENS, value.toString())
         }
 
     var pathMode: PathMode

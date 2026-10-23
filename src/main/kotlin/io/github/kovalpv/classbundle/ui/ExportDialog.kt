@@ -4,9 +4,11 @@ import com.intellij.ide.bookmark.BookmarkType
 import com.intellij.ide.bookmark.BookmarksManager
 import com.intellij.notification.NotificationGroupManager
 import com.intellij.notification.NotificationType
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.application.runReadAction
+import com.intellij.openapi.diagnostic.Logger
 import com.intellij.openapi.fileChooser.FileChooserFactory
 import com.intellij.openapi.fileChooser.FileSaverDescriptor
 import com.intellij.openapi.progress.ProcessCanceledException
@@ -14,6 +16,7 @@ import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.DumbService
+import com.intellij.openapi.project.IndexNotReadyException
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.Messages
@@ -52,13 +55,23 @@ internal class ExportDialog(
     private val className: String,
 ) : DialogWrapper(project) {
 
+    private val logger = Logger.getInstance(RelatedFilesCollector::class.java)
+
     private val collector = RelatedFilesCollector()
 
-    // --- Preview infrastructure ----------------------------------------------
+    // --- Preview infrastructure ---
     private var previewSeq: Int = 0
     private val previewAlarm = Alarm(disposable)
 
-    // --- UI controls ---------------------------------------------------------
+    /**
+     * Резолвнутый целевой класс. Не `lazy`: если первый резолв случился до
+     * готовности индексов, `lazy` закэшировал бы `null` на весь диалог.
+     * Обновляется только на UI-потоке внутри `finishOnUiThread`.
+     */
+    @Volatile
+    private var targetClass: PsiClass? = null
+
+    // --- UI controls ---
     private val usageCheckbox = JCheckBox(ClassBundleBundle.message("relation.usages"))
     private val inheritorsCheckbox = JCheckBox(ClassBundleBundle.message("relation.inheritors"))
     private val nestedCheckbox = JCheckBox(ClassBundleBundle.message("relation.nested"))
@@ -81,7 +94,7 @@ internal class ExportDialog(
     private val contextFormatCombo = JComboBox(ContextFormat.entries.toTypedArray()).apply {
         renderer = object : DefaultListCellRenderer() {
             override fun getListCellRendererComponent(
-                list: javax.swing.JList<*>?,
+                list: JList<*>,
                 value: Any?,
                 index: Int,
                 isSelected: Boolean,
@@ -93,26 +106,23 @@ internal class ExportDialog(
             }
         }
     }
+
     private val maxTokensLabel = JBLabel(ClassBundleBundle.message("output.context.maxTokens"))
     private val maxTokensField = JBTextField(ExportPreferences.DEFAULT_MAX_TOKENS.toString(), 8)
+    private val copyToClipboardCheckbox =
+        JCheckBox(ClassBundleBundle.message("output.context.copyToClipboard"))
 
     private val outputPathField = TextFieldWithBrowseButton()
     private val previewList = JBList<String>(listOf())
     private val previewCountLabel = JBLabel()
 
-    private val targetClass: PsiClass? by lazy {
-        runReadAction {
-            JavaPsiFacade.getInstance(project).findClass(
-                className,
-                GlobalSearchScope.projectScope(project),
-            )
-        }
-    }
-
     init {
         title = ClassBundleBundle.message("dialog.title")
 
+        // ВАЖНО: везде ниже используем одно и то же имя `prefs`
+        // (в исходном PDF было `prefS`, что давало Unresolved reference).
         val prefs = ExportPreferences
+
         usageCheckbox.isSelected = RelationType.USAGE in prefs.selectedRelations
         inheritorsCheckbox.isSelected = RelationType.INHERITOR in prefs.selectedRelations
         nestedCheckbox.isSelected = RelationType.NESTED in prefs.selectedRelations
@@ -129,19 +139,22 @@ internal class ExportDialog(
 
         contextFormatCombo.selectedItem = prefs.contextFormat
         maxTokensField.text = (prefs.maxTokens ?: ExportPreferences.DEFAULT_MAX_TOKENS).toString()
-
-        val dir = prefs.outputDir.ifBlank { project.basePath ?: "" }
-        outputPathField.text = if (dir.isNotBlank()) {
-            "$dir${File.separator}${prefs.filePattern}"
-        } else {
-            ""
-        }
+        copyToClipboardCheckbox.isSelected = prefs.copyContextToClipboard
 
         val isContext = contextRadio.isSelected
         contextFormatLabel.isEnabled = isContext
         contextFormatCombo.isEnabled = isContext
         maxTokensLabel.isEnabled = isContext
         maxTokensField.isEnabled = isContext
+        copyToClipboardCheckbox.isEnabled = isContext
+        updateOutputPathEnabled()
+
+        val dir = prefs.outputDir.ifBlank { project.basePath ?: "" }
+        outputPathField.text = if (dir.isNotBlank()) {
+            "${dir}${File.separator}${prefs.filePattern}"
+        } else {
+            ""
+        }
 
         outputPathField.button.addActionListener {
             val currentText = outputPathField.text.trim()
@@ -179,9 +192,16 @@ internal class ExportDialog(
         })
 
         super.init()
+
+        // Первый расчёт — уже после того, как диалог построен. Не из
+        // createCenterPanel(): там ещё не гарантировано, что проект вне dumb mode.
+        ApplicationManager.getApplication().invokeLater(
+            { schedulePreview() },
+            ModalityState.any(),
+        )
     }
 
-    // --- DialogWrapper overrides ---------------------------------------------
+    // --- DialogWrapper overrides ---
 
     override fun createCenterPanel(): JComponent {
         val content = JPanel(BorderLayout(0, 8))
@@ -189,12 +209,16 @@ internal class ExportDialog(
         content.add(createPreviewPanel(), BorderLayout.SOUTH)
         attachPreviewListeners()
         isOKActionEnabled = canExport()
-        schedulePreview()
         return content
     }
 
     override fun doOKAction() {
         if (!canExport()) return
+
+        if (DumbService.isDumb(project)) {
+            notifyError(ClassBundleBundle.message("export.error.indexNotReady"))
+            return
+        }
 
         val prefs = ExportPreferences
         prefs.selectedRelations = selectedRelations()
@@ -203,6 +227,7 @@ internal class ExportDialog(
         prefs.contextFormat =
             contextFormatCombo.selectedItem as? ContextFormat ?: ContextFormat.MARKDOWN
         prefs.maxTokens = parseMaxTokens()
+        prefs.copyContextToClipboard = copyToClipboardCheckbox.isSelected
 
         val request = try {
             buildRequest()
@@ -211,30 +236,37 @@ internal class ExportDialog(
             return
         }
 
-        val parent = request.outputPath.toFile().parentFile
-        if (parent != null) prefs.outputDir = parent.absolutePath
-        prefs.filePattern = request.outputPath.toFile().name
+        // Путь сохраняем только если он реально есть (не clipboard-режим).
+        if (request.outputPath != null) {
+            val parent = request.outputPath.toFile().parentFile
+            if (parent != null) prefs.outputDir = parent.absolutePath
+            prefs.filePattern = request.outputPath.toFile().name
+        }
 
         super.doOKAction()
 
         ProgressManager.getInstance().run(
             object : Task.Backgroundable(project, "Exporting classes", true) {
                 override fun run(indicator: ProgressIndicator) {
-                    try {
-                        DumbService.getInstance(project).runReadActionInSmartMode<Unit> {
+                    val result = try {
+                        DumbService.getInstance(project).runReadActionInSmartMode<ExportResult> {
                             ExportService.export(request, indicator)
                         }
                     } catch (e: ProcessCanceledException) {
                         throw e
                     } catch (e: Exception) {
                         notifyError(e.message ?: "Export failed")
+                        return
+                    }
+                    if (request.copyToClipboard && result.success) {
+                        notifyClipboardSuccess(result)
                     }
                 }
             },
         )
     }
 
-    override fun createLeftSideActions(): Array<javax.swing.Action> {
+    override fun createLeftSideActions(): Array<Action> {
         val addToFavoritesAction = object :
             AbstractAction(ClassBundleBundle.message("action.addToFavorites")) {
             override fun actionPerformed(e: ActionEvent?) {
@@ -244,11 +276,13 @@ internal class ExportDialog(
         return arrayOf(addToFavoritesAction)
     }
 
-    // --- Actions -------------------------------------------------------------
+    // --- Actions ---
 
     private fun addToFavorites() {
         val relations = selectedRelations()
-        val cls = targetClass ?: return
+        val cls = targetClass?.takeIf { it.isValid }
+            ?: resolveTargetClassForAction()
+            ?: return
         if (relations.isEmpty()) {
             notifyError(ClassBundleBundle.message("export.error.noFiles"))
             return
@@ -263,7 +297,7 @@ internal class ExportDialog(
             defaultName,
             null,
         ) ?: return
-        if (listName.isBlank()) return
+        if (listName.isEmpty()) return
 
         ReadAction.nonBlocking(Callable {
             RelatedFilesCollector().collect(project, cls, relations).map { it.file }
@@ -300,7 +334,6 @@ internal class ExportDialog(
                     }
 
                     val commonPrefix = getCommonPackagePrefix(project, sortedFiles)
-
                     for (file in sortedFiles) {
                         val bookmark = bookmarksManager.createBookmark(file)
                         if (bookmark != null) {
@@ -363,7 +396,7 @@ internal class ExportDialog(
         return if (prefixLength > 0) first.take(prefixLength).joinToString(".") + "." else ""
     }
 
-    // --- Panels --------------------------------------------------------------
+    // --- Panels ---
 
     private fun createOptionsPanel(): JPanel {
         val includePanel = JPanel(GridLayout(0, 1, 0, 4))
@@ -397,13 +430,16 @@ internal class ExportDialog(
         contextOptions.add(contextFormatCombo)
         contextOptions.add(maxTokensLabel)
         contextOptions.add(maxTokensField)
+        contextOptions.add(copyToClipboardCheckbox)
         archivePanel.add(contextOptions)
 
         val outputPanel = JPanel(BorderLayout(8, 0))
         outputPanel.add(JBLabel(ClassBundleBundle.message("output.label")), BorderLayout.WEST)
         outputPanel.add(outputPathField, BorderLayout.CENTER)
 
-        val box = JPanel().apply { layout = BoxLayout(this, BoxLayout.Y_AXIS) }
+        val box = JPanel().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+        }
         for (panel in listOf(includePanel, pathPanel, archivePanel, outputPanel)) {
             box.add(panel)
             box.add(Box.createVerticalStrut(10))
@@ -414,7 +450,9 @@ internal class ExportDialog(
     private fun createPreviewPanel(): JComponent {
         previewList.isEnabled = false
         previewList.emptyText.text = ClassBundleBundle.message("preview.empty")
-        previewCountLabel.text = ClassBundleBundle.message("preview.count", 0)
+        // Не «0», пока первый расчёт не завершился — иначе визуально кажется,
+        // что ничего не найдено, хотя поиск ещё идёт.
+        previewCountLabel.text = ClassBundleBundle.message("preview.loading")
 
         val panel = JPanel(BorderLayout(0, 4))
         panel.add(previewCountLabel, BorderLayout.NORTH)
@@ -425,7 +463,7 @@ internal class ExportDialog(
         return panel
     }
 
-    // --- Preview wiring ------------------------------------------------------
+    // --- Preview wiring ---
 
     private fun attachPreviewListeners() {
         val listener = ActionListener { invalidatePreview() }
@@ -437,22 +475,29 @@ internal class ExportDialog(
             component.addActionListener(listener)
         }
 
-        val modeListener = ActionListener {
+        val modelListener = ActionListener {
             val isContext = contextRadio.isSelected
             contextFormatLabel.isEnabled = isContext
             contextFormatCombo.isEnabled = isContext
             maxTokensLabel.isEnabled = isContext
             maxTokensField.isEnabled = isContext
+            copyToClipboardCheckbox.isEnabled = isContext
+            updateOutputPathEnabled()
             updateOutputExtension()
             invalidatePreview()
         }
-        filesRadio.addActionListener(modeListener)
-        pathsRadio.addActionListener(modeListener)
-        contextRadio.addActionListener(modeListener)
+        filesRadio.addActionListener(modelListener)
+        pathsRadio.addActionListener(modelListener)
+        contextRadio.addActionListener(modelListener)
 
         contextFormatCombo.addActionListener {
             updateOutputExtension()
             invalidatePreview()
+        }
+
+        copyToClipboardCheckbox.addActionListener {
+            updateOutputPathEnabled()
+            isOKActionEnabled = canExport()
         }
 
         maxTokensField.document.addDocumentListener(object : DocumentListener {
@@ -462,10 +507,20 @@ internal class ExportDialog(
         })
     }
 
+    private fun updateOutputPathEnabled() {
+        val clipboardActive = contextRadio.isSelected && copyToClipboardCheckbox.isSelected
+        outputPathField.isEnabled = !clipboardActive
+    }
+
     private fun invalidatePreview() {
         isOKActionEnabled = canExport()
         schedulePreview()
     }
+
+    private data class PreviewResult(
+        val targetClass: PsiClass?,
+        val preview: ExportPreview,
+    )
 
     private fun schedulePreview() {
         previewAlarm.cancelAllRequests()
@@ -477,21 +532,34 @@ internal class ExportDialog(
         } else {
             null
         }
-        val cls = targetClass
-        if (cls == null) {
-            updatePreview(ExportPreview(emptyList(), 0L))
-            return
-        }
+
+        // Пока идёт расчёт — показываем «Collecting files...», а не старый/ложный 0.
+        previewCountLabel.text = ClassBundleBundle.message("preview.loading")
+        isOKActionEnabled = false
 
         previewAlarm.addRequest({
             ReadAction.nonBlocking(Callable {
-                ExportService.preview(project, cls, relations, format)
+                val cls = try {
+                    findTargetClass()
+                } catch (e: IndexNotReadyException) {
+                    null
+                }
+
+                if (cls == null) {
+                    PreviewResult(targetClass = null, preview = ExportPreview(emptyList(), 0L))
+                } else {
+                    PreviewResult(
+                        targetClass = cls,
+                        preview = ExportService.preview(project, cls, relations, format),
+                    )
+                }
             })
                 .inSmartMode(project)
                 .expireWith(disposable)
-                .finishOnUiThread(ModalityState.any()) { preview ->
+                .finishOnUiThread(ModalityState.any()) { result ->
                     if (seq != previewSeq) return@finishOnUiThread
-                    updatePreview(preview)
+                    targetClass = result.targetClass
+                    updatePreview(result.preview)
                 }
                 .submit(AppExecutorUtil.getAppExecutorService())
         }, PREVIEW_DEBOUNCE_MS)
@@ -499,13 +567,17 @@ internal class ExportDialog(
 
     private fun updatePreview(preview: ExportPreview) {
         val files = preview.files
-        val labels = files.map { file ->
-            val psiFile = PsiManager.getInstance(project).findFile(file)
-            val psiClass = psiFile?.let {
-                PsiTreeUtil.findChildOfType(it, PsiClass::class.java)
+
+        val labels = runReadAction<List<String>> {
+            files.map { file ->
+                val psiFile = PsiManager.getInstance(project).findFile(file)
+                val psiClass = psiFile?.let {
+                    PsiTreeUtil.findChildOfType(it, PsiClass::class.java)
+                }
+                psiClass?.qualifiedName ?: file.name
             }
-            psiClass?.qualifiedName ?: file.name
         }
+
         val shown = if (labels.size <= PREVIEW_MAX_ROWS) {
             labels
         } else {
@@ -530,7 +602,7 @@ internal class ExportDialog(
         isOKActionEnabled = canExport()
     }
 
-    // --- Helpers -------------------------------------------------------------
+    // --- Helpers ---
 
     private fun selectedRelations(): Set<RelationType> = buildSet {
         if (usageCheckbox.isSelected) add(RelationType.USAGE)
@@ -546,8 +618,7 @@ internal class ExportDialog(
         else -> OutputMode.FILES_ZIP
     }
 
-    private fun parseMaxTokens(): Int? =
-        maxTokensField.text.trim().toIntOrNull()
+    private fun parseMaxTokens(): Int? = maxTokensField.text.trim().toIntOrNull()
 
     private fun currentExtension(): String = when (selectedOutputMode()) {
         OutputMode.CONTEXT_FILE ->
@@ -557,16 +628,15 @@ internal class ExportDialog(
     }
 
     private fun updateOutputExtension() {
+        if (copyToClipboardCheckbox.isSelected && contextRadio.isSelected) return
         val raw = outputPathField.text.trim()
         if (raw.isEmpty()) return
         val current = File(raw)
         val known = setOf("zip", "md", "txt", "json", "xml")
         val currentExt = current.extension.lowercase()
         if (currentExt !in known) return
-
         val newExt = currentExtension()
         if (currentExt == newExt) return
-
         val newName = if (current.nameWithoutExtension.isEmpty()) {
             "classbundle.$newExt"
         } else {
@@ -576,26 +646,36 @@ internal class ExportDialog(
         outputPathField.text = newFile.absolutePath
     }
 
-    private fun canExport(): Boolean =
-        outputPathField.text.isNotBlank() &&
-                targetClass != null &&
-                selectedRelations().isNotEmpty()
+    private fun canExport(): Boolean {
+        if (targetClass == null) return false
+        if (selectedRelations().isEmpty()) return false
+        if (contextRadio.isSelected && copyToClipboardCheckbox.isSelected) return true
+        return outputPathField.text.isNotBlank()
+    }
 
     private fun buildRequest(): ExportRequest {
-        val cls = targetClass
-            ?: error("Target class '$className' not found in project")
+        val cls = targetClass?.takeIf { it.isValid }
+            ?: resolveTargetClassForAction()
+            ?: error(
+                ClassBundleBundle.message(
+                    "export.error.targetNotFound",
+                    className,
+                )
+            )
+
         val mode = selectedOutputMode()
         val format = contextFormatCombo.selectedItem as? ContextFormat ?: ContextFormat.MARKDOWN
         val raw = outputPathField.text.trim()
+        val copyToClipboard = mode == OutputMode.CONTEXT_FILE && copyToClipboardCheckbox.isSelected
 
-        val outputFile = when (mode) {
-            OutputMode.CONTEXT_FILE ->
-                if (raw.endsWith(".${format.extension}", ignoreCase = true)) File(raw)
-                else File("$raw.${format.extension}")
-
-            else ->
-                if (raw.endsWith(".zip", ignoreCase = true)) File(raw)
-                else File("$raw.zip")
+        val outputFile: File? = if (copyToClipboard) {
+            null
+        } else if (mode == OutputMode.CONTEXT_FILE) {
+            if (raw.endsWith(".${format.extension}", ignoreCase = true)) File(raw)
+            else File("$raw.${format.extension}")
+        } else {
+            if (raw.endsWith(".zip", ignoreCase = true)) File(raw)
+            else File("$raw.zip")
         }
 
         return ExportRequest(
@@ -605,7 +685,8 @@ internal class ExportDialog(
             outputMode = mode,
             contextFormat = format,
             maxTokens = parseMaxTokens(),
-            outputPath = outputFile.toPath(),
+            outputPath = outputFile?.toPath(),
+            copyToClipboard = copyToClipboard,
             project = project,
         )
     }
@@ -619,6 +700,45 @@ internal class ExportDialog(
             .getNotificationGroup("ClassBundle")
             .createNotification(message, NotificationType.ERROR)
             .notify(project)
+    }
+
+    private fun notifyClipboardSuccess(result: ExportResult) {
+        NotificationGroupManager.getInstance()
+            .getNotificationGroup("ClassBundle")
+            .createNotification(
+                ClassBundleBundle.message("notification.clipboard.success", result.exportedCount),
+                NotificationType.INFORMATION,
+            )
+            .notify(project)
+    }
+
+    // --- Target class resolution ---
+
+    /**
+     * Только внутри read action. Не кэширует `null` — если индексы не готовы,
+     * вернёт `null`, и следующий `schedulePreview()` попробует снова.
+     */
+    private fun findTargetClass(): PsiClass? {
+        val facade = JavaPsiFacade.getInstance(project)
+        return facade.findClass(className, GlobalSearchScope.projectScope(project))
+            ?: facade.findClass(className, GlobalSearchScope.allScope(project))
+    }
+
+    /**
+     * Безопасный синхронный резолв для действий на EDT (OK, Favorites).
+     * Возвращает `null`, если проект в dumb mode или индексы ещё не готовы —
+     * вызывающая сторона должна показать понятную ошибку.
+     */
+    private fun resolveTargetClassForAction(): PsiClass? {
+        if (DumbService.isDumb(project)) return null
+        return try {
+            ApplicationManager.getApplication().runReadAction<PsiClass?> {
+                findTargetClass()
+            }
+        } catch (e: IndexNotReadyException) {
+            logger.warn("Target class resolution postponed: indexes are not ready", e)
+            null
+        }
     }
 
     private companion object {

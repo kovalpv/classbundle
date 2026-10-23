@@ -20,6 +20,10 @@ internal class ContextBundleWriter {
 
     fun write(request: ExportRequest, files: List<RelatedFile>): ExportResult {
         val target = request.outputPath
+            ?: return ExportResult.failure(
+                null,
+                "Output path is required for ${request.outputMode.name}"
+            )
         logger.info(
             "Writing context bundle: format=${request.contextFormat.name}, " +
                     "files=${files.size}, maxTokens=${request.maxTokens}, target=$target"

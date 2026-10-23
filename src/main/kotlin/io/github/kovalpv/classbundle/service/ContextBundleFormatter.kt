@@ -41,6 +41,7 @@ internal object ContextBundleFormatter {
 
     private sealed class Prepared {
         abstract val related: RelatedFile
+
         data class Ok(override val related: RelatedFile, val content: String) : Prepared()
         data class Skipped(override val related: RelatedFile, val reason: String) : Prepared()
     }
@@ -213,7 +214,8 @@ internal object ContextBundleFormatter {
             sb.append("      \"path\": \"")
                 .append(jsonEscape(displayPath(request, entry.related.file)))
                 .append("\",\n")
-            sb.append("      \"role\": \"").append(entry.related.role.name.lowercase()).append("\",\n")
+            sb.append("      \"role\": \"").append(entry.related.role.name.lowercase())
+                .append("\",\n")
             sb.append("      \"content\": \"").append(jsonEscape(entry.content)).append("\"\n")
             sb.append("    }").append(if (idx < included.size - 1) "," else "").append("\n")
         }
@@ -294,6 +296,7 @@ internal object ContextBundleFormatter {
             "over token budget" -> "over token budget"
             else -> prepared.reason
         }
+
         is Prepared.Ok -> ""
     }
 
