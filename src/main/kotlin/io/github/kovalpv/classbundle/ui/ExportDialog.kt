@@ -4,14 +4,17 @@ import com.intellij.ide.bookmark.BookmarkType
 import com.intellij.ide.bookmark.BookmarksManager
 import com.intellij.notification.NotificationGroupManager
 import com.intellij.notification.NotificationType
+import com.intellij.openapi.application.EDT
 import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.application.runReadAction
 import com.intellij.openapi.fileChooser.FileChooserFactory
 import com.intellij.openapi.fileChooser.FileSaverDescriptor
+import com.intellij.openapi.progress.ProcessCanceledException
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.progress.Task
+import com.intellij.openapi.project.DumbService
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.Messages
@@ -25,6 +28,7 @@ import com.intellij.psi.search.GlobalSearchScope
 import com.intellij.psi.util.PsiTreeUtil
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBList
+import com.intellij.util.Alarm
 import com.intellij.util.concurrency.AppExecutorUtil
 import io.github.kovalpv.classbundle.ClassBundleBundle
 import io.github.kovalpv.classbundle.model.ArchiveMode
@@ -34,13 +38,26 @@ import io.github.kovalpv.classbundle.model.RelationType
 import io.github.kovalpv.classbundle.service.ExportPreferences
 import io.github.kovalpv.classbundle.service.ExportService
 import io.github.kovalpv.classbundle.service.RelatedFilesCollector
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import java.awt.BorderLayout
 import java.awt.Dimension
 import java.awt.GridLayout
 import java.awt.event.ActionEvent
+import java.awt.event.ActionListener
 import java.io.File
 import java.util.concurrent.Callable
-import javax.swing.*
+import javax.swing.AbstractAction
+import javax.swing.Box
+import javax.swing.BoxLayout
+import javax.swing.ButtonGroup
+import javax.swing.JCheckBox
+import javax.swing.JComponent
+import javax.swing.JPanel
+import javax.swing.JRadioButton
+import javax.swing.JScrollPane
 import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
 
@@ -51,6 +68,12 @@ internal class ExportDialog(
 
     private val collector = RelatedFilesCollector()
 
+    // --- Preview infrastructure -------------------------------------------------
+    private var previewSeq: Int = 0
+    private val previewScope = CoroutineScope(SupervisorJob() + Dispatchers.EDT)
+    private val previewAlarm = Alarm(previewScope)
+
+    // --- UI controls ------------------------------------------------------------
     private val usageCheckbox = JCheckBox(ClassBundleBundle.message("relation.usages"))
     private val inheritorsCheckbox = JCheckBox(ClassBundleBundle.message("relation.inheritors"))
     private val nestedCheckbox = JCheckBox(ClassBundleBundle.message("relation.nested"))
@@ -62,12 +85,10 @@ internal class ExportDialog(
 
     private val relativeRadio = JRadioButton(ClassBundleBundle.message("path.relative"))
     private val absoluteRadio = JRadioButton(ClassBundleBundle.message("path.absolute"))
-
     private val filesRadio = JRadioButton(ClassBundleBundle.message("archive.files"))
     private val pathsRadio = JRadioButton(ClassBundleBundle.message("archive.paths"))
 
     private val outputPathField = TextFieldWithBrowseButton()
-
     private val previewList = JBList<String>(listOf())
     private val previewCountLabel = JBLabel()
 
@@ -87,6 +108,7 @@ internal class ExportDialog(
         usageCheckbox.isSelected = RelationType.USAGE in prefs.selectedRelations
         inheritorsCheckbox.isSelected = RelationType.INHERITOR in prefs.selectedRelations
         nestedCheckbox.isSelected = RelationType.NESTED in prefs.selectedRelations
+        dependencyCheckbox.isSelected = RelationType.DEPENDENCY in prefs.selectedRelations
 
         relativeRadio.isSelected = prefs.pathMode == PathMode.RELATIVE
         absoluteRadio.isSelected = prefs.pathMode == PathMode.ABSOLUTE
@@ -110,7 +132,8 @@ internal class ExportDialog(
                 "Select a path to save the exported Class Bundle",
                 "zip"
             )
-            val dialog = FileChooserFactory.getInstance().createSaveFileDialog(descriptor, project)
+            val dialog = FileChooserFactory.getInstance()
+                .createSaveFileDialog(descriptor, project)
 
             val initialDir = currentFile?.parentFile?.let {
                 LocalFileSystem.getInstance().findFileByIoFile(it)
@@ -137,6 +160,11 @@ internal class ExportDialog(
         super.init()
     }
 
+    override fun dispose() {
+        previewScope.cancel()
+        super.dispose()
+    }
+
     private fun updateOkState() {
         isOKActionEnabled = canExport()
     }
@@ -147,7 +175,7 @@ internal class ExportDialog(
         content.add(createPreviewPanel(), BorderLayout.SOUTH)
         attachPreviewListeners()
         isOKActionEnabled = canExport()
-        refreshPreview()
+        schedulePreview()
         return content
     }
 
@@ -176,7 +204,11 @@ internal class ExportDialog(
             object : Task.Backgroundable(project, "Exporting classes", true) {
                 override fun run(indicator: ProgressIndicator) {
                     try {
-                        ExportService.export(request, indicator)
+                        DumbService.getInstance(project).runReadActionInSmartMode<Unit> {
+                            ExportService.export(request, indicator)
+                        }
+                    } catch (e: ProcessCanceledException) {
+                        throw e
                     } catch (e: Exception) {
                         notifyError(e.message ?: "Export failed")
                     }
@@ -185,27 +217,25 @@ internal class ExportDialog(
         )
     }
 
-    override fun createLeftSideActions(): Array<Action> {
-        val addToFavoritesAction =
-            object : AbstractAction(ClassBundleBundle.message("action.addToFavorites")) {
-                override fun actionPerformed(e: ActionEvent?) {
-                    addToFavorites()
-                }
+    override fun createLeftSideActions(): Array<javax.swing.Action> {
+        val addToFavoritesAction = object :
+            AbstractAction(ClassBundleBundle.message("action.addToFavorites")) {
+            override fun actionPerformed(e: ActionEvent?) {
+                addToFavorites()
             }
+        }
         return arrayOf(addToFavoritesAction)
     }
 
     private fun addToFavorites() {
         val relations = selectedRelations()
         val cls = targetClass ?: return
-
         if (relations.isEmpty()) {
             notifyError(ClassBundleBundle.message("export.error.noFiles"))
             return
         }
 
         val defaultName = className.substringAfterLast('.').ifBlank { "ClassBundle" }
-
         val listName = Messages.showInputDialog(
             project,
             ClassBundleBundle.message("dialog.favorites.prompt"),
@@ -214,28 +244,25 @@ internal class ExportDialog(
             defaultName,
             null
         ) ?: return
-
         if (listName.isBlank()) return
 
         ReadAction.nonBlocking(Callable {
             RelatedFilesCollector().collect(project, cls, relations)
         })
             .inSmartMode(project)
+            .expireWith(disposable)
             .finishOnUiThread(ModalityState.any()) { files ->
                 if (files.isEmpty()) {
                     notifyError(ClassBundleBundle.message("export.error.noFiles"))
                     return@finishOnUiThread
                 }
-
                 try {
-                    val bookmarksManager =
-                        BookmarksManager.getInstance(project) ?: return@finishOnUiThread
-
+                    val bookmarksManager = BookmarksManager.getInstance(project)
+                        ?: return@finishOnUiThread
                     var group = bookmarksManager.getGroup(listName)
                     if (group == null) {
                         group = bookmarksManager.addGroup(listName, true)
                     }
-
                     if (group == null) return@finishOnUiThread
 
                     val allBookmarks = bookmarksManager.bookmarks
@@ -247,8 +274,9 @@ internal class ExportDialog(
 
                     val sortedFiles = files.sortedBy { file ->
                         val psiFile = PsiManager.getInstance(project).findFile(file)
-                        val psiClass =
-                            psiFile?.let { PsiTreeUtil.findChildOfType(it, PsiClass::class.java) }
+                        val psiClass = psiFile?.let {
+                            PsiTreeUtil.findChildOfType(it, PsiClass::class.java)
+                        }
                         psiClass?.qualifiedName ?: file.name
                     }
 
@@ -259,23 +287,17 @@ internal class ExportDialog(
                         if (bookmark != null) {
                             val psiFile = PsiManager.getInstance(project).findFile(file)
                             val psiClass = psiFile?.let {
-                                PsiTreeUtil.findChildOfType(
-                                    it,
-                                    PsiClass::class.java
-                                )
+                                PsiTreeUtil.findChildOfType(it, PsiClass::class.java)
                             }
                             val qualifiedName = psiClass?.qualifiedName ?: file.name
-
-                            val description =
-                                if (commonPrefix.isNotEmpty() && qualifiedName.startsWith(
-                                        commonPrefix
-                                    )
-                                ) {
-                                    qualifiedName.removePrefix(commonPrefix)
-                                } else {
-                                    qualifiedName
-                                }
-
+                            val description = if (
+                                commonPrefix.isNotEmpty() &&
+                                qualifiedName.startsWith(commonPrefix)
+                            ) {
+                                qualifiedName.removePrefix(commonPrefix)
+                            } else {
+                                qualifiedName
+                            }
                             group.add(bookmark, BookmarkType.DEFAULT, description)
                         }
                     }
@@ -291,7 +313,6 @@ internal class ExportDialog(
                             NotificationType.INFORMATION
                         )
                         .notify(project)
-
                 } catch (e: Exception) {
                     notifyError("Failed to add to bookmarks: ${e.message}")
                 }
@@ -302,7 +323,9 @@ internal class ExportDialog(
     private fun getCommonPackagePrefix(project: Project, files: List<VirtualFile>): String {
         val packages = files.mapNotNull { file ->
             val psiFile = PsiManager.getInstance(project).findFile(file)
-            val psiClass = psiFile?.let { PsiTreeUtil.findChildOfType(it, PsiClass::class.java) }
+            val psiClass = psiFile?.let {
+                PsiTreeUtil.findChildOfType(it, PsiClass::class.java)
+            }
             psiClass?.qualifiedName?.substringBeforeLast('.')
         }.distinct()
 
@@ -311,7 +334,6 @@ internal class ExportDialog(
         val splitPackages = packages.map { it.split('.') }
         val first = splitPackages.first()
         var prefixLength = 0
-
         for (i in first.indices) {
             if (splitPackages.all { it.size > i && it[i] == first[i] }) {
                 prefixLength++
@@ -319,7 +341,6 @@ internal class ExportDialog(
                 break
             }
         }
-
         return if (prefixLength > 0) first.take(prefixLength).joinToString(".") + "." else ""
     }
 
@@ -361,8 +382,10 @@ internal class ExportDialog(
         previewList.isEnabled = false
         previewList.emptyText.text = ClassBundleBundle.message("preview.empty")
         previewCountLabel.text = ClassBundleBundle.message("preview.count", 0)
+
         val panel = JPanel(BorderLayout(0, 4))
         panel.add(previewCountLabel, BorderLayout.NORTH)
+
         val scroll = JScrollPane(previewList)
         scroll.preferredSize = Dimension(scroll.preferredSize.width, 180)
         panel.add(scroll, BorderLayout.CENTER)
@@ -370,19 +393,65 @@ internal class ExportDialog(
     }
 
     private fun canExport(): Boolean =
-        outputPathField.text.isNotBlank() && targetClass != null && selectedRelations().isNotEmpty()
+        outputPathField.text.isNotBlank() &&
+                targetClass != null &&
+                selectedRelations().isNotEmpty()
 
     private fun attachPreviewListeners() {
-        val listener = java.awt.event.ItemListener { _ ->
+        val listener = ActionListener {
             isOKActionEnabled = canExport()
-            refreshPreview()
+            schedulePreview()
         }
         for (component in listOf(
-            usageCheckbox, inheritorsCheckbox, nestedCheckbox,
+            usageCheckbox, inheritorsCheckbox, nestedCheckbox, dependencyCheckbox,
             relativeRadio, absoluteRadio, filesRadio, pathsRadio
         )) {
-            component.addItemListener(listener)
+            component.addActionListener(listener)
         }
+    }
+
+    private fun schedulePreview() {
+        previewAlarm.cancelAllRequests()
+
+        val seq = ++previewSeq
+        val relations = selectedRelations().toSet()
+        val cls = targetClass
+        if (cls == null) {
+            updatePreview(emptyList())
+            return
+        }
+
+        previewAlarm.addRequest({
+            ReadAction.nonBlocking(Callable {
+                ExportService.preview(project, cls, relations).files
+            })
+                .inSmartMode(project)
+                .expireWith(disposable)
+                .finishOnUiThread(ModalityState.any()) { files ->
+                    if (seq != previewSeq) return@finishOnUiThread
+                    updatePreview(files)
+                }
+                .submit(AppExecutorUtil.getAppExecutorService())
+        }, PREVIEW_DEBOUNCE_MS)
+    }
+
+    private fun updatePreview(files: List<VirtualFile>) {
+        val labels = files.map { file ->
+            val psiFile = PsiManager.getInstance(project).findFile(file)
+            val psiClass = psiFile?.let {
+                PsiTreeUtil.findChildOfType(it, PsiClass::class.java)
+            }
+            psiClass?.qualifiedName ?: file.name
+        }
+        val shown = if (labels.size <= PREVIEW_MAX_ROWS) {
+            labels
+        } else {
+            labels.take(PREVIEW_MAX_ROWS) +
+                    ClassBundleBundle.message("preview.more", labels.size - PREVIEW_MAX_ROWS)
+        }
+        previewList.setListData(shown.toTypedArray())
+        previewCountLabel.text = ClassBundleBundle.message("preview.count", files.size)
+        isOKActionEnabled = canExport()
     }
 
     private fun selectedRelations(): Set<RelationType> = buildSet {
@@ -395,11 +464,11 @@ internal class ExportDialog(
     private fun buildRequest(): ExportRequest {
         val cls = targetClass
         checkNotNull(cls) { "Target class '$className' not found in project" }
+
         val pathMode = if (relativeRadio.isSelected) PathMode.RELATIVE else PathMode.ABSOLUTE
-
         val archiveMode = if (filesRadio.isSelected) ArchiveMode.FILES else ArchiveMode.PATH_LIST
-
         val outputZip = File(outputPathField.text.trim()).toPath()
+
         return ExportRequest(
             targetClass = cls,
             relations = selectedRelations(),
@@ -410,40 +479,15 @@ internal class ExportDialog(
         )
     }
 
-    private fun refreshPreview() {
-        val relations = selectedRelations()
-        val cls = targetClass
-        if (cls == null || relations.isEmpty()) {
-            previewList.setListData(arrayOf())
-            previewCountLabel.text = ClassBundleBundle.message("preview.count", 0)
-            return
-        }
-
-        ReadAction.nonBlocking(Callable {
-            val previewResult = ExportService.preview(project, cls, relations)
-            previewResult.files.map { it.toString() }
-        })
-            .inSmartMode(project)
-            .coalesceBy(this)
-            .finishOnUiThread(ModalityState.any()) { fileNames ->
-                previewList.setListData(fileNames.toTypedArray())
-                previewCountLabel.text = ClassBundleBundle.message("preview.count", fileNames.size)
-            }
-            .submit(AppExecutorUtil.getAppExecutorService())
+    private fun notifyError(message: String) {
+        NotificationGroupManager.getInstance()
+            .getNotificationGroup("ClassBundle")
+            .createNotification(message, NotificationType.ERROR)
+            .notify(project)
     }
 
-    private fun notifyError(message: String) {
-        try {
-            NotificationGroupManager.getInstance()
-                .getNotificationGroup("ClassBundle")
-                .createNotification(
-                    ClassBundleBundle.message("notification.error.title"),
-                    message,
-                    NotificationType.ERROR
-                )
-                .notify(project)
-        } catch (e: Exception) {
-            // Фоллбек
-        }
+    private companion object {
+        private const val PREVIEW_DEBOUNCE_MS = 200
+        private const val PREVIEW_MAX_ROWS = 200
     }
 }

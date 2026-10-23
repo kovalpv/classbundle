@@ -2,6 +2,8 @@ package io.github.kovalpv.classbundle.service
 
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.diagnostic.Logger
+import com.intellij.openapi.progress.ProcessCanceledException
+import com.intellij.openapi.project.IndexNotReadyException
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.psi.JavaRecursiveElementWalkingVisitor
@@ -16,25 +18,16 @@ import io.github.kovalpv.classbundle.model.RelationType
 /**
  * Сборка списка связанных файлов (FR-4, FR-5, FR-6, FR-7, SDD §9).
  *
- * Правила:
- * - USAGES — `ReferencesSearch.search(psiClass, projectScope, …)` → `containingFile.virtualFile`;
- * - INHERITORS — `ClassInheritorsSearch.search(psiClass, projectScope, true)` → `containingFile.virtualFile`;
- * - NESTED — `psiClass.nestedClasses` → `containingFile.virtualFile`;
- * - файл целевого класса (self) всегда включается, независимо от выбранных связей (FR-6);
- * - дедупликация по `VirtualFile` (FR-7).
- *
- * Все обращения к PSI выполняются внутри `ReadAction`, вызов возможен
- * из фонового потока (а не только из EDT). Ошибки PSI (исчезнувшие
- * элементы) логируются на уровне warn и пропускаются (SDD §9).
+ * Все обращения к PSI выполняются внутри `ReadAction`; вызов возможен
+ * из фонового потока. Ошибки PSI (исчезнувшие элементы) логируются на
+ * уровне warn и пропускаются. Control-flow исключения
+ * ([ProcessCanceledException], [IndexNotReadyException]) пробрасываются:
+ * это сигналы «отменились» и «повтори позже», а не ошибка конкретной связи.
  */
 internal class RelatedFilesCollector {
 
     private val logger = Logger.getInstance(RelatedFilesCollector::class.java)
 
-    /**
-     * Возвращает уникальный отсортированный по пути набор связанных файлов.
-     * Вызов разрешён из фонового потока; read-action приобретается внутри.
-     */
     fun collect(
         project: Project,
         targetClass: PsiClass,
@@ -44,7 +37,6 @@ internal class RelatedFilesCollector {
             doCollect(project, targetClass, relations)
         }
 
-    /** Удобная обёртка: параметры берутся из готового [ExportRequest]. */
     fun collect(request: ExportRequest): List<VirtualFile> =
         collect(request.project, request.targetClass, request.relations)
 
@@ -59,9 +51,10 @@ internal class RelatedFilesCollector {
         }
 
         val result = LinkedHashSet<VirtualFile>()
-        addFile(targetClass.containingFile?.virtualFile, result)
+        addFile(targetClass.containingFile.virtualFile, result)
 
         val scope = GlobalSearchScope.projectScope(project)
+
         relations.forEach { relation ->
             try {
                 when (relation) {
@@ -70,8 +63,12 @@ internal class RelatedFilesCollector {
                     RelationType.NESTED -> collectNested(targetClass, result)
                     RelationType.DEPENDENCY -> collectDependencies(project, targetClass, result)
                 }
+            } catch (e: ProcessCanceledException) {
+                throw e
+            } catch (e: IndexNotReadyException) {
+                throw e
             } catch (e: Exception) {
-                logger.warn("PSI search failed for relation $relation: ${e.message}", e)
+                logger.warn("PSI search failed for relation $relation", e)
             }
         }
 
@@ -85,8 +82,7 @@ internal class RelatedFilesCollector {
         result: MutableSet<VirtualFile>
     ) {
         ReferencesSearch.search(targetClass, scope).forEach { reference ->
-            val psiElement = reference.element
-            addFile(psiElement.containingFile?.virtualFile, result)
+            addFile(reference.element.containingFile?.virtualFile, result)
         }
     }
 
@@ -101,7 +97,7 @@ internal class RelatedFilesCollector {
     }
 
     private fun collectNested(targetClass: PsiClass, result: MutableSet<VirtualFile>) {
-        targetClass.allInnerClasses.forEach { nested ->
+        targetClass.innerClasses.forEach { nested ->
             addFile(nested.containingFile?.virtualFile, result)
         }
     }
@@ -130,12 +126,19 @@ internal class RelatedFilesCollector {
             override fun visitReferenceElement(reference: PsiJavaCodeReferenceElement) {
                 super.visitReferenceElement(reference)
 
-                val resolved = reference.resolve() as? PsiClass ?: return
-
-                if (resolved == targetClass) return
+                val resolved: PsiClass? = try {
+                    reference.resolve() as? PsiClass
+                } catch (e: ProcessCanceledException) {
+                    throw e
+                } catch (e: IndexNotReadyException) {
+                    throw e
+                } catch (e: Exception) {
+                    logger.warn("Failed to resolve reference: ${reference.text}", e)
+                    null
+                }
+                if (resolved == null || resolved == targetClass) return
 
                 val virtualFile = resolved.containingFile?.virtualFile ?: return
-
                 if (projectScope.contains(virtualFile)) {
                     addFile(virtualFile, result)
                 }
