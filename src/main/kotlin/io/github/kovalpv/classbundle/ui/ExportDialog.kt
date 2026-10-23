@@ -4,7 +4,6 @@ import com.intellij.ide.bookmark.BookmarkType
 import com.intellij.ide.bookmark.BookmarksManager
 import com.intellij.notification.NotificationGroupManager
 import com.intellij.notification.NotificationType
-import com.intellij.openapi.application.EDT
 import com.intellij.openapi.application.ModalityState
 import com.intellij.openapi.application.ReadAction
 import com.intellij.openapi.application.runReadAction
@@ -28,22 +27,22 @@ import com.intellij.psi.search.GlobalSearchScope
 import com.intellij.psi.util.PsiTreeUtil
 import com.intellij.ui.components.JBLabel
 import com.intellij.ui.components.JBList
+import com.intellij.ui.components.JBTextField
 import com.intellij.util.Alarm
 import com.intellij.util.concurrency.AppExecutorUtil
 import io.github.kovalpv.classbundle.ClassBundleBundle
-import io.github.kovalpv.classbundle.model.ArchiveMode
+import io.github.kovalpv.classbundle.model.ContextFormat
+import io.github.kovalpv.classbundle.model.ExportPreview
 import io.github.kovalpv.classbundle.model.ExportRequest
+import io.github.kovalpv.classbundle.model.OutputMode
 import io.github.kovalpv.classbundle.model.PathMode
 import io.github.kovalpv.classbundle.model.RelationType
 import io.github.kovalpv.classbundle.service.ExportPreferences
 import io.github.kovalpv.classbundle.service.ExportService
 import io.github.kovalpv.classbundle.service.RelatedFilesCollector
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import java.awt.BorderLayout
 import java.awt.Dimension
+import java.awt.FlowLayout
 import java.awt.GridLayout
 import java.awt.event.ActionEvent
 import java.awt.event.ActionListener
@@ -53,7 +52,9 @@ import javax.swing.AbstractAction
 import javax.swing.Box
 import javax.swing.BoxLayout
 import javax.swing.ButtonGroup
+import javax.swing.DefaultListCellRenderer
 import javax.swing.JCheckBox
+import javax.swing.JComboBox
 import javax.swing.JComponent
 import javax.swing.JPanel
 import javax.swing.JRadioButton
@@ -68,12 +69,11 @@ internal class ExportDialog(
 
     private val collector = RelatedFilesCollector()
 
-    // --- Preview infrastructure -------------------------------------------------
+    // --- Preview infrastructure ----------------------------------------------
     private var previewSeq: Int = 0
-    private val previewScope = CoroutineScope(SupervisorJob() + Dispatchers.EDT)
-    private val previewAlarm = Alarm(previewScope)
+    private val previewAlarm = Alarm(disposable)
 
-    // --- UI controls ------------------------------------------------------------
+    // --- UI controls ---------------------------------------------------------
     private val usageCheckbox = JCheckBox(ClassBundleBundle.message("relation.usages"))
     private val inheritorsCheckbox = JCheckBox(ClassBundleBundle.message("relation.inheritors"))
     private val nestedCheckbox = JCheckBox(ClassBundleBundle.message("relation.nested"))
@@ -85,8 +85,29 @@ internal class ExportDialog(
 
     private val relativeRadio = JRadioButton(ClassBundleBundle.message("path.relative"))
     private val absoluteRadio = JRadioButton(ClassBundleBundle.message("path.absolute"))
+
     private val filesRadio = JRadioButton(ClassBundleBundle.message("archive.files"))
     private val pathsRadio = JRadioButton(ClassBundleBundle.message("archive.paths"))
+    private val contextRadio = JRadioButton(ClassBundleBundle.message("output.context"))
+
+    private val contextFormatLabel = JBLabel(ClassBundleBundle.message("output.context.format"))
+    private val contextFormatCombo = JComboBox(ContextFormat.entries.toTypedArray()).apply {
+        renderer = object : DefaultListCellRenderer() {
+            override fun getListCellRendererComponent(
+                list: javax.swing.JList<*>?,
+                value: Any?,
+                index: Int,
+                isSelected: Boolean,
+                cellHasFocus: Boolean,
+            ): java.awt.Component {
+                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus)
+                if (value is ContextFormat) text = value.displayName
+                return this
+            }
+        }
+    }
+    private val maxTokensLabel = JBLabel(ClassBundleBundle.message("output.context.maxTokens"))
+    private val maxTokensField = JBTextField(ExportPreferences.DEFAULT_MAX_TOKENS.toString(), 8)
 
     private val outputPathField = TextFieldWithBrowseButton()
     private val previewList = JBList<String>(listOf())
@@ -96,7 +117,7 @@ internal class ExportDialog(
         runReadAction {
             JavaPsiFacade.getInstance(project).findClass(
                 className,
-                GlobalSearchScope.projectScope(project)
+                GlobalSearchScope.projectScope(project),
             )
         }
     }
@@ -113,8 +134,12 @@ internal class ExportDialog(
         relativeRadio.isSelected = prefs.pathMode == PathMode.RELATIVE
         absoluteRadio.isSelected = prefs.pathMode == PathMode.ABSOLUTE
 
-        filesRadio.isSelected = prefs.archiveMode == ArchiveMode.FILES
-        pathsRadio.isSelected = prefs.archiveMode == ArchiveMode.PATH_LIST
+        filesRadio.isSelected = prefs.outputMode == OutputMode.FILES_ZIP
+        pathsRadio.isSelected = prefs.outputMode == OutputMode.PATHS_ZIP
+        contextRadio.isSelected = prefs.outputMode == OutputMode.CONTEXT_FILE
+
+        contextFormatCombo.selectedItem = prefs.contextFormat
+        maxTokensField.text = (prefs.maxTokens ?: ExportPreferences.DEFAULT_MAX_TOKENS).toString()
 
         val dir = prefs.outputDir.ifBlank { project.basePath ?: "" }
         outputPathField.text = if (dir.isNotBlank()) {
@@ -123,14 +148,21 @@ internal class ExportDialog(
             ""
         }
 
+        val isContext = contextRadio.isSelected
+        contextFormatLabel.isEnabled = isContext
+        contextFormatCombo.isEnabled = isContext
+        maxTokensLabel.isEnabled = isContext
+        maxTokensField.isEnabled = isContext
+
         outputPathField.button.addActionListener {
             val currentText = outputPathField.text.trim()
             val currentFile = if (currentText.isNotEmpty()) File(currentText) else null
+            val ext = currentExtension()
 
             val descriptor = FileSaverDescriptor(
                 ClassBundleBundle.message("export.fileChooser.title"),
                 "Select a path to save the exported Class Bundle",
-                "zip"
+                ext,
             )
             val dialog = FileChooserFactory.getInstance()
                 .createSaveFileDialog(descriptor, project)
@@ -138,13 +170,13 @@ internal class ExportDialog(
             val initialDir = currentFile?.parentFile?.let {
                 LocalFileSystem.getInstance().findFileByIoFile(it)
             }
-            val initialName = currentFile?.name ?: "classbundle.zip"
+            val initialName = currentFile?.name ?: "classbundle.$ext"
 
             val wrapper = dialog.save(initialDir, initialName)
             if (wrapper != null) {
                 var path = wrapper.file.absolutePath
-                if (!path.endsWith(".zip", ignoreCase = true)) {
-                    path += ".zip"
+                if (!path.endsWith(".$ext", ignoreCase = true)) {
+                    path += ".$ext"
                 }
                 outputPathField.text = path
                 updateOkState()
@@ -160,14 +192,7 @@ internal class ExportDialog(
         super.init()
     }
 
-    override fun dispose() {
-        previewScope.cancel()
-        super.dispose()
-    }
-
-    private fun updateOkState() {
-        isOKActionEnabled = canExport()
-    }
+    // --- DialogWrapper overrides ---------------------------------------------
 
     override fun createCenterPanel(): JComponent {
         val content = JPanel(BorderLayout(0, 8))
@@ -185,11 +210,10 @@ internal class ExportDialog(
         val prefs = ExportPreferences
         prefs.selectedRelations = selectedRelations()
         prefs.pathMode = if (relativeRadio.isSelected) PathMode.RELATIVE else PathMode.ABSOLUTE
-        prefs.archiveMode = if (filesRadio.isSelected) ArchiveMode.FILES else ArchiveMode.PATH_LIST
-
-        val outputFile = File(outputPathField.text.trim())
-        outputFile.parent?.let { prefs.outputDir = it }
-        prefs.filePattern = outputFile.name
+        prefs.outputMode = selectedOutputMode()
+        prefs.contextFormat =
+            contextFormatCombo.selectedItem as? ContextFormat ?: ContextFormat.MARKDOWN
+        prefs.maxTokens = parseMaxTokens()
 
         val request = try {
             buildRequest()
@@ -197,6 +221,10 @@ internal class ExportDialog(
             notifyError(e.message ?: ClassBundleBundle.message("export.error.noFiles"))
             return
         }
+
+        val parent = request.outputPath.toFile().parentFile
+        if (parent != null) prefs.outputDir = parent.absolutePath
+        prefs.filePattern = request.outputPath.toFile().name
 
         super.doOKAction()
 
@@ -213,7 +241,7 @@ internal class ExportDialog(
                         notifyError(e.message ?: "Export failed")
                     }
                 }
-            }
+            },
         )
     }
 
@@ -226,6 +254,8 @@ internal class ExportDialog(
         }
         return arrayOf(addToFavoritesAction)
     }
+
+    // --- Actions -------------------------------------------------------------
 
     private fun addToFavorites() {
         val relations = selectedRelations()
@@ -242,12 +272,12 @@ internal class ExportDialog(
             ClassBundleBundle.message("dialog.favorites.title"),
             Messages.getQuestionIcon(),
             defaultName,
-            null
+            null,
         ) ?: return
         if (listName.isBlank()) return
 
         ReadAction.nonBlocking(Callable {
-            RelatedFilesCollector().collect(project, cls, relations)
+            RelatedFilesCollector().collect(project, cls, relations).map { it.file }
         })
             .inSmartMode(project)
             .expireWith(disposable)
@@ -308,9 +338,9 @@ internal class ExportDialog(
                             ClassBundleBundle.message(
                                 "notification.favorites.success",
                                 files.size,
-                                listName
+                                listName,
                             ),
-                            NotificationType.INFORMATION
+                            NotificationType.INFORMATION,
                         )
                         .notify(project)
                 } catch (e: Exception) {
@@ -344,6 +374,8 @@ internal class ExportDialog(
         return if (prefixLength > 0) first.take(prefixLength).joinToString(".") + "." else ""
     }
 
+    // --- Panels --------------------------------------------------------------
+
     private fun createOptionsPanel(): JPanel {
         val includePanel = JPanel(GridLayout(0, 1, 0, 4))
         includePanel.add(usageCheckbox)
@@ -355,16 +387,27 @@ internal class ExportDialog(
         val pathPanel = JPanel(GridLayout(0, 1, 0, 4))
         pathPanel.add(relativeRadio)
         pathPanel.add(absoluteRadio)
-        val pathGroup = ButtonGroup()
-        pathGroup.add(relativeRadio)
-        pathGroup.add(absoluteRadio)
+        ButtonGroup().apply {
+            add(relativeRadio)
+            add(absoluteRadio)
+        }
 
         val archivePanel = JPanel(GridLayout(0, 1, 0, 4))
         archivePanel.add(filesRadio)
         archivePanel.add(pathsRadio)
-        val archiveGroup = ButtonGroup()
-        archiveGroup.add(filesRadio)
-        archiveGroup.add(pathsRadio)
+        archivePanel.add(contextRadio)
+        ButtonGroup().apply {
+            add(filesRadio)
+            add(pathsRadio)
+            add(contextRadio)
+        }
+
+        val contextOptions = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
+        contextOptions.add(contextFormatLabel)
+        contextOptions.add(contextFormatCombo)
+        contextOptions.add(maxTokensLabel)
+        contextOptions.add(maxTokensField)
+        archivePanel.add(contextOptions)
 
         val outputPanel = JPanel(BorderLayout(8, 0))
         outputPanel.add(JBLabel(ClassBundleBundle.message("output.label")), BorderLayout.WEST)
@@ -392,22 +435,45 @@ internal class ExportDialog(
         return panel
     }
 
-    private fun canExport(): Boolean =
-        outputPathField.text.isNotBlank() &&
-                targetClass != null &&
-                selectedRelations().isNotEmpty()
+    // --- Preview wiring ------------------------------------------------------
 
     private fun attachPreviewListeners() {
-        val listener = ActionListener {
-            isOKActionEnabled = canExport()
-            schedulePreview()
-        }
+        val listener = ActionListener { invalidatePreview() }
         for (component in listOf(
             usageCheckbox, inheritorsCheckbox, nestedCheckbox, dependencyCheckbox,
-            relativeRadio, absoluteRadio, filesRadio, pathsRadio
+            relativeRadio, absoluteRadio,
         )) {
             component.addActionListener(listener)
         }
+
+        val modeListener = ActionListener {
+            val isContext = contextRadio.isSelected
+            contextFormatLabel.isEnabled = isContext
+            contextFormatCombo.isEnabled = isContext
+            maxTokensLabel.isEnabled = isContext
+            maxTokensField.isEnabled = isContext
+            updateOutputExtension()
+            invalidatePreview()
+        }
+        filesRadio.addActionListener(modeListener)
+        pathsRadio.addActionListener(modeListener)
+        contextRadio.addActionListener(modeListener)
+
+        contextFormatCombo.addActionListener {
+            updateOutputExtension()
+            invalidatePreview()
+        }
+
+        maxTokensField.document.addDocumentListener(object : DocumentListener {
+            override fun insertUpdate(e: DocumentEvent) = invalidatePreview()
+            override fun removeUpdate(e: DocumentEvent) = invalidatePreview()
+            override fun changedUpdate(e: DocumentEvent) = invalidatePreview()
+        })
+    }
+
+    private fun invalidatePreview() {
+        isOKActionEnabled = canExport()
+        schedulePreview()
     }
 
     private fun schedulePreview() {
@@ -415,27 +481,33 @@ internal class ExportDialog(
 
         val seq = ++previewSeq
         val relations = selectedRelations().toSet()
+        val format = if (selectedOutputMode() == OutputMode.CONTEXT_FILE) {
+            contextFormatCombo.selectedItem as? ContextFormat ?: ContextFormat.MARKDOWN
+        } else {
+            null
+        }
         val cls = targetClass
         if (cls == null) {
-            updatePreview(emptyList())
+            updatePreview(ExportPreview(emptyList(), 0L))
             return
         }
 
         previewAlarm.addRequest({
             ReadAction.nonBlocking(Callable {
-                ExportService.preview(project, cls, relations).files
+                ExportService.preview(project, cls, relations, format)
             })
                 .inSmartMode(project)
                 .expireWith(disposable)
-                .finishOnUiThread(ModalityState.any()) { files ->
+                .finishOnUiThread(ModalityState.any()) { preview ->
                     if (seq != previewSeq) return@finishOnUiThread
-                    updatePreview(files)
+                    updatePreview(preview)
                 }
                 .submit(AppExecutorUtil.getAppExecutorService())
         }, PREVIEW_DEBOUNCE_MS)
     }
 
-    private fun updatePreview(files: List<VirtualFile>) {
+    private fun updatePreview(preview: ExportPreview) {
+        val files = preview.files
         val labels = files.map { file ->
             val psiFile = PsiManager.getInstance(project).findFile(file)
             val psiClass = psiFile?.let {
@@ -450,9 +522,24 @@ internal class ExportDialog(
                     ClassBundleBundle.message("preview.more", labels.size - PREVIEW_MAX_ROWS)
         }
         previewList.setListData(shown.toTypedArray())
-        previewCountLabel.text = ClassBundleBundle.message("preview.count", files.size)
+
+        val countText = ClassBundleBundle.message("preview.count", files.size)
+        previewCountLabel.text = if (selectedOutputMode() == OutputMode.CONTEXT_FILE) {
+            val tokens = preview.tokenEstimate
+            val limit = parseMaxTokens()
+            val tokenText = if (limit != null && tokens > limit) {
+                ClassBundleBundle.message("preview.tokens.warning", tokens, limit)
+            } else {
+                ClassBundleBundle.message("preview.tokens", tokens)
+            }
+            "$countText — $tokenText"
+        } else {
+            countText
+        }
         isOKActionEnabled = canExport()
     }
+
+    // --- Helpers -------------------------------------------------------------
 
     private fun selectedRelations(): Set<RelationType> = buildSet {
         if (usageCheckbox.isSelected) add(RelationType.USAGE)
@@ -461,22 +548,76 @@ internal class ExportDialog(
         if (dependencyCheckbox.isSelected) add(RelationType.DEPENDENCY)
     }
 
+    private fun selectedOutputMode(): OutputMode = when {
+        contextRadio.isSelected -> OutputMode.CONTEXT_FILE
+        pathsRadio.isSelected -> OutputMode.PATHS_ZIP
+        else -> OutputMode.FILES_ZIP
+    }
+
+    private fun parseMaxTokens(): Int? =
+        maxTokensField.text.trim().toIntOrNull()
+
+    private fun currentExtension(): String = when (selectedOutputMode()) {
+        OutputMode.CONTEXT_FILE ->
+            (contextFormatCombo.selectedItem as? ContextFormat ?: ContextFormat.MARKDOWN).extension
+        else -> "zip"
+    }
+
+    private fun updateOutputExtension() {
+        val raw = outputPathField.text.trim()
+        if (raw.isEmpty()) return
+        val current = File(raw)
+        val known = setOf("zip", "md", "txt", "json", "xml")
+        val currentExt = current.extension.lowercase()
+        if (currentExt !in known) return
+
+        val newExt = currentExtension()
+        if (currentExt == newExt) return
+
+        val newName = if (current.nameWithoutExtension.isEmpty()) {
+            "classbundle.$newExt"
+        } else {
+            "${current.nameWithoutExtension}.$newExt"
+        }
+        val newFile = current.parentFile?.let { File(it, newName) } ?: File(newName)
+        outputPathField.text = newFile.absolutePath
+    }
+
+    private fun canExport(): Boolean =
+        outputPathField.text.isNotBlank() &&
+                targetClass != null &&
+                selectedRelations().isNotEmpty()
+
     private fun buildRequest(): ExportRequest {
         val cls = targetClass
-        checkNotNull(cls) { "Target class '$className' not found in project" }
+            ?: error("Target class '$className' not found in project")
+        val mode = selectedOutputMode()
+        val format = contextFormatCombo.selectedItem as? ContextFormat ?: ContextFormat.MARKDOWN
+        val raw = outputPathField.text.trim()
 
-        val pathMode = if (relativeRadio.isSelected) PathMode.RELATIVE else PathMode.ABSOLUTE
-        val archiveMode = if (filesRadio.isSelected) ArchiveMode.FILES else ArchiveMode.PATH_LIST
-        val outputZip = File(outputPathField.text.trim()).toPath()
+        val outputFile = when (mode) {
+            OutputMode.CONTEXT_FILE ->
+                if (raw.endsWith(".${format.extension}", ignoreCase = true)) File(raw)
+                else File("$raw.${format.extension}")
+            else ->
+                if (raw.endsWith(".zip", ignoreCase = true)) File(raw)
+                else File("$raw.zip")
+        }
 
         return ExportRequest(
             targetClass = cls,
             relations = selectedRelations(),
-            pathMode = pathMode,
-            archiveMode = archiveMode,
-            outputZip = outputZip,
-            project = project
+            pathMode = if (relativeRadio.isSelected) PathMode.RELATIVE else PathMode.ABSOLUTE,
+            outputMode = mode,
+            contextFormat = format,
+            maxTokens = parseMaxTokens(),
+            outputPath = outputFile.toPath(),
+            project = project,
         )
+    }
+
+    private fun updateOkState() {
+        isOKActionEnabled = canExport()
     }
 
     private fun notifyError(message: String) {

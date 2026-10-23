@@ -28,22 +28,43 @@ internal object PathFormatter {
      * @return строка пути в ОС-зависимых разделителях.
      */
     fun format(file: VirtualFile, baseDir: Path?, mode: PathMode): String {
-        val absolute = file.toNioPath()
+        val absolute = try {
+            file.toNioPath()
+        } catch (e: UnsupportedOperationException) {
+            // VFS без NIO-представления (temp:, jar:) — используем строковый путь.
+            logger.info("File ${file.path} is not NIO-backed, using string path")
+            return file.path
+        }
         return when (mode) {
-            PathMode.ABSOLUTE -> absolute.toAbsolutePath().toString()
+            PathMode.ABSOLUTE -> absolute.toAbsolutePath().normalize().toString()
             PathMode.RELATIVE -> relativize(absolute, baseDir)
         }
     }
 
     private fun relativize(path: Path, baseDir: Path?): String {
         if (baseDir == null) {
-            return path.toAbsolutePath().toString()
+            return path.toAbsolutePath().normalize().toString()
         }
+
+        val absolutePath = path.toAbsolutePath().normalize()
+        val absoluteBase = baseDir.toAbsolutePath().normalize()
+
         return try {
-            baseDir.relativize(path).toString()
+            val relative = absoluteBase.relativize(absolutePath)
+            if (relative.startsWith("..")) {
+                logger.info(
+                    "File $absolutePath is outside baseDir $absoluteBase, using absolute path",
+                )
+                absolutePath.toString()
+            } else {
+                relative.toString()
+            }
         } catch (e: IllegalArgumentException) {
-            logger.info("File $path is outside baseDir $baseDir, using absolute path")
-            path.toAbsolutePath().toString()
+            // Разные корни (Windows drive letters, разные провайдеры).
+            logger.info(
+                "File $absolutePath cannot be relativized to $absoluteBase, using absolute path",
+            )
+            absolutePath.toString()
         }
     }
 }

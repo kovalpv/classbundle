@@ -1,48 +1,79 @@
 package io.github.kovalpv.classbundle.service
 
 import com.intellij.ide.util.PropertiesComponent
-import io.github.kovalpv.classbundle.model.ArchiveMode
+import io.github.kovalpv.classbundle.model.ContextFormat
+import io.github.kovalpv.classbundle.model.OutputMode
 import io.github.kovalpv.classbundle.model.PathMode
 import io.github.kovalpv.classbundle.model.RelationType
 
 /**
- * Persistent export preferences (FR-12).
+ * Сохранённые настройки экспорта (FR-12).
  *
- * Stored per user in the application scope via [PropertiesComponent]; the
- * values seed the export dialog and are rewritten on every successful export.
+ * Мигрирует со старых ключей `archiveMode` / `filePattern` (v1.0.x)
+ * на `outputMode` / `contextFormat` / `maxTokens`.
  */
 internal object ExportPreferences {
 
-    private const val KEY_ARCHIVE_MODE = "classbundle.export.archiveMode"
+    private const val KEY_OUTPUT_MODE = "classbundle.export.outputMode"
+    private const val KEY_CONTEXT_FORMAT = "classbundle.export.contextFormat"
+    private const val KEY_MAX_TOKENS = "classbundle.export.maxTokens"
     private const val KEY_PATH_MODE = "classbundle.export.pathMode"
     private const val KEY_RELATIONS = "classbundle.export.relations"
     private const val KEY_OUTPUT_DIR = "classbundle.export.outputDir"
     private const val KEY_FILE_PATTERN = "classbundle.export.filePattern"
 
+    // legacy key, мигрируем на KEY_OUTPUT_MODE
+    private const val KEY_LEGACY_ARCHIVE_MODE = "classbundle.export.archiveMode"
+
     const val DEFAULT_FILE_PATTERN = "classbundle.zip"
+    const val DEFAULT_MAX_TOKENS = 100_000
 
     private val props = PropertiesComponent.getInstance()
-
     private val defaultRelations: Set<RelationType> =
         setOf(RelationType.USAGE, RelationType.INHERITOR)
 
-    var archiveMode: ArchiveMode
-        get() = ArchiveMode.entries.firstOrNull { it.name == props.getValue(KEY_ARCHIVE_MODE) }
-            ?: ArchiveMode.FILES
-        set(value) = props.setValue(KEY_ARCHIVE_MODE, value.name)
+    var outputMode: OutputMode
+        get() {
+            val raw = props.getValue(KEY_OUTPUT_MODE)
+            if (raw != null) {
+                return OutputMode.entries.firstOrNull { it.name == raw } ?: OutputMode.FILES_ZIP
+            }
+            return when (props.getValue(KEY_LEGACY_ARCHIVE_MODE)) {
+                "PATH_LIST" -> OutputMode.PATHS_ZIP
+                else -> OutputMode.FILES_ZIP
+            }
+        }
+        set(value) = props.setValue(KEY_OUTPUT_MODE, value.name)
+
+    var contextFormat: ContextFormat
+        get() = ContextFormat.entries
+            .firstOrNull { it.name == props.getValue(KEY_CONTEXT_FORMAT) }
+            ?: ContextFormat.MARKDOWN
+        set(value) = props.setValue(KEY_CONTEXT_FORMAT, value.name)
+
+    var maxTokens: Int?
+        get() = props.getValue(KEY_MAX_TOKENS)?.toIntOrNull()
+        set(value) {
+            if (value == null) {
+                props.unsetValue(KEY_MAX_TOKENS)
+            } else {
+                props.setValue(KEY_MAX_TOKENS, value.toString())
+            }
+        }
 
     var pathMode: PathMode
-        get() = PathMode.entries.firstOrNull { it.name == props.getValue(KEY_PATH_MODE) }
+        get() = PathMode.entries
+            .firstOrNull { it.name == props.getValue(KEY_PATH_MODE) }
             ?: PathMode.RELATIVE
         set(value) = props.setValue(KEY_PATH_MODE, value.name)
 
     var selectedRelations: Set<RelationType>
         get() {
             val raw = props.getValue(KEY_RELATIONS) ?: return defaultRelations
-            val parsed = raw.split(",").mapNotNull { name ->
-                RelationType.entries.firstOrNull { it.name == name.trim() }
-            }.toSet()
-            return parsed.ifEmpty { defaultRelations }
+            val parsed = raw.split(",")
+                .mapNotNull { name -> RelationType.entries.firstOrNull { it.name == name.trim() } }
+                .toSet()
+            return if (parsed.isEmpty()) defaultRelations else parsed
         }
         set(value) = props.setValue(KEY_RELATIONS, value.joinToString(",") { it.name })
 
