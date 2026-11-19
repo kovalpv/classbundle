@@ -39,8 +39,8 @@ dependencies {
 
     // IntelliJ Platform Gradle Plugin Dependencies Extension - read more: https://plugins.jetbrains.com/docs/intellij/tools-intellij-platform-gradle-plugin-dependencies-extension.html
     intellijPlatform {
-        local("/Applications/IntelliJ IDEA 25.3.app/Contents")
-        // intellijIdea(providers.gradleProperty("platformVersion")) // раскомментировать, когда загрузки IDE из JetBrains будут доступны
+        intellijIdea(providers.gradleProperty("platformVersion"))
+        // local("/Applications/IntelliJ IDEA 25.3.app/Contents") // для локальной разработки
 
         // Plugin Dependencies. Uses `platformBundledPlugins` property from the gradle.properties file for bundled IntelliJ Platform plugins.
         bundledPlugins(providers.gradleProperty("platformBundledPlugins").map { it.split(',') })
