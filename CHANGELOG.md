@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.1] - 2025-11-20
+
 ### Added
 - Export related files action (usages, inheritors, nested classes).
 - Export dialog with file preview and progress bar.

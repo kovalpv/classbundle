@@ -51,31 +51,3 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-      - name: Create/Update GitHub Release
-        if: github.event_name != 'pull_request'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v0.1.1-SNAPSHOT
-          draft: true
-          prerelease: true
-          files: build/distributions/*
-          body: |
-            **Auto-built from** [`${{ github.sha }}`](https://github.com/kovalpv/classbundle/commit/${{ github.sha }})
-
-            <details>
-            <summary>Build info</summary>
-
-            - Commit: ${{ github.sha }}
-            - Branch: ${{ github.ref_name }}
-            - Trigger: ${{ github.event_name }}
-            - Date: ${{ github.event.head_commit.date }}
-
-            </details>
-
-            ### Установка
-            1. Скачать `classbundle-0.1.1-SNAPSHOT.zip`
-            2. IntelliJ IDEA → Settings → Plugins → ⚙️ → *Install Plugin from Disk…*
-            3. Выбрать скачанный ZIP и перезапустить IDE
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
